@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from .utils import pause_and_warn, save_pickle, annotate, dedup
 import os
 import json
-from matplotlib.widgets import TextBox
+from matplotlib.widgets import TextBox, Button
 from itertools import chain
 from . import __version__
 
@@ -128,28 +128,44 @@ class RectSelector(BaseEventHandler):
             rect, = ax.plot([], [], linestyle='--', color='r')
             self.rects[ax] = rect
         self.finish = finish
-    
+
     def onpress(self, event):
+        if event.inaxes not in self.rects:
+            self.ax = None
+            return
+
+        if event.xdata is None or event.ydata is None:
+            self.ax = None
+            return
+
         self.finished = False
         self.ax = event.inaxes
         self.x0, self.y0 = event.xdata, event.ydata
-    
+
     def onmove_down(self, event):
         if event.inaxes == self.ax:
             self.x1, self.y1 = event.xdata, event.ydata
-            
+
             x, y  = self.get_xydata()
             self.rects[self.ax].set_data(x, y)
             self.rects[self.ax].set_marker('')
             self.fig.canvas.draw()
             
     def onrelease(self, event):
-        self.x0, self.x1 = np.sort((self.x0, self.x1))
-        self.y0, self.y1 = np.sort((self.y0, self.y1))
+        if self.ax is None or self.ax not in self.rects:
+            return
+
+        x1 = getattr(self, 'x1', self.x0)
+        y1 = getattr(self, 'y1', self.y0)
+
+        self.x0, x1 = np.sort((self.x0, x1))
+        self.y0, y1 = np.sort((self.y0, y1))
+        self.x1, self.y1 = x1, y1
+
         self.rects[self.ax].set_marker('s')
         self.fig.canvas.draw()
-        
-        if self.finish: 
+
+        if self.finish:
             self.finished = True
         
     def get_xydata(self, closed=True):
@@ -345,7 +361,7 @@ class RectObjectSelector(RectSelector):
     }
 
     def init(self, objects, ax=None, mode='touch'):
-        super().init()
+        super().init(finish=False)
         if ax is None:
             ax = getattr(self.fig, 'ax', None)
             if ax is None:
@@ -362,10 +378,24 @@ class RectObjectSelector(RectSelector):
 
         self._held_mode = None
         self.mode = None
+        self._finish_button = None
 
         plot_objects(self.objects, ax=self.display_ax)
 
         self._set_mode(mode)
+        self._add_finish_button()
+
+    def _add_finish_button(self):
+        bbox = self.display_ax.get_position()
+        width = 0.12
+        height = 0.05
+        margin = 0.02
+        x = max(margin, min(bbox.x1 - width, 1 - width - margin))
+        y = max(margin, bbox.y0 - height - margin)
+        self._finish_button_ax = self.fig.add_axes([x, y, width, height])
+        self._finish_button = Button(self._finish_button_ax, 'Done')
+        self._finish_button.on_clicked(self._finish_selection)
+        self._finish_button_ax._selector_ignore = True  # prevent picking up drag events
 
     def _set_mode(self, mode, *, force=False):
         normalized = normalize_rect_mode(mode)
@@ -384,6 +414,7 @@ class RectObjectSelector(RectSelector):
             hint = 'Press [M] to remove, hold Alt to temporarily remove, [R] to reset.'
         else:
             hint = 'Press [M] to keep instead, [R] to reset.'
+        hint += ' Click Done or press Enter when finished.'
         self.display_ax.set_title(f"Mode: {style['title']}. {hint}")
         self.fig.canvas.draw_idle()
 
@@ -393,6 +424,9 @@ class RectObjectSelector(RectSelector):
 
     def onrelease(self, event):
         super().onrelease(event)
+
+        if self.ax is None:
+            return
 
         touched = rect_filter_objects(self.objects, self.x0, self.x1, self.y0, self.y1, mode=self.mode)
         self.last_selected = touched
@@ -428,10 +462,21 @@ class RectObjectSelector(RectSelector):
         elif event.key == 'alt' and self._held_mode is not None:
             self._set_mode(self._held_mode)
             self._held_mode = None
-            
+        elif event.key in ('enter', 'return'):
+            self._finish_selection()
+
     def get_filtered_objects(self):
         # print(self.selected)
         return get_filtered_objects(self.orig_objects, self.selected)
+
+    def _finish_selection(self, _event=None):
+        if self.finished:
+            return
+
+        self.finished = True
+        self.display_ax.set_title('Selection complete. Close window to continue.')
+        self.fig.canvas.draw_idle()
+        plt.close(self.fig)
     
     
 class DataExtractor(BaseEventHandler):
