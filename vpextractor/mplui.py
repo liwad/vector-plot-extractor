@@ -6,7 +6,7 @@ Created on Thu Jan 18 19:28:30 2024
 """
 
 import numpy as np
-from .filter import select_paths, rect_filter_objects, get_filtered_objects
+from .filter import select_paths, rect_filter_objects, get_filtered_objects, normalize_rect_mode
 from copy import copy, deepcopy
 from .drawing import add, plot_objects, get_color, Line2D
 import matplotlib.pyplot as plt
@@ -339,56 +339,95 @@ class ElementIdentifier(BaseEventHandler):
         return types, known_markers
     
 class RectObjectSelector(RectSelector):
+    MODE_STYLES = {
+        'touch': {'title': 'Keep touched objects', 'color': '#2ca02c'},
+        'subtract': {'title': 'Remove touched objects', 'color': '#d62728'},
+    }
+
     def init(self, objects, ax=None, mode='touch'):
-        # modes: 
-        #     'touch': if any part of the group of object in this region (in other words, if the rectangle "touches" the object), select
-        
         super().init()
-        self.objects = objects
         if ax is None:
-            ax = self.fig.ax
-        self.ax = ax
+            ax = getattr(self.fig, 'ax', None)
+            if ax is None:
+                if not self.fig.axes:
+                    raise ValueError('expected an Axes for RectObjectSelector')
+                ax = self.fig.axes[0]
+
+        self.display_ax = ax
         self.objects = deepcopy(objects)
         self.orig_objects = objects
         self.selected = {}
         for typ, typ_objs in objects.items():
             self.selected[typ] = np.full(len(typ_objs), True, dtype=bool)
-        
-        self.mode = mode
-        
-        plot_objects((self.objects))
-        
-        self.ax.set_title('change [M]ode, [R]estart, or select rectangle')
-        
+
+        self._held_mode = None
+        self.mode = None
+
+        plot_objects(self.objects, ax=self.display_ax)
+
+        self._set_mode(mode)
+
+    def _set_mode(self, mode, *, force=False):
+        normalized = normalize_rect_mode(mode)
+        if not force and normalized == self.mode:
+            return
+
+        self.mode = normalized
+        style = self.MODE_STYLES[self.mode]
+        for rect in self.rects.values():
+            rect.set_color(style['color'])
+        self._update_title()
+
+    def _update_title(self):
+        style = self.MODE_STYLES[self.mode]
+        if self.mode == 'touch':
+            hint = 'Press [M] to remove, hold Alt to temporarily remove, [R] to reset.'
+        else:
+            hint = 'Press [M] to keep instead, [R] to reset.'
+        self.display_ax.set_title(f"Mode: {style['title']}. {hint}")
+        self.fig.canvas.draw_idle()
+
+    def _toggle_mode(self):
+        next_mode = 'subtract' if self.mode != 'subtract' else 'touch'
+        self._set_mode(next_mode)
+
     def onrelease(self, event):
         super().onrelease(event)
-        
-        selected = rect_filter_objects(self.objects, self.x0, self.x1, self.y0, self.y1, mode=self.mode)
-        self.last_selected = selected
-        # print(selected)
-        
+
+        touched = rect_filter_objects(self.objects, self.x0, self.x1, self.y0, self.y1, mode=self.mode)
+        self.last_selected = touched
+
         for typ, typ_objs in self.objects.items():
-            for idx in np.where(self.selected[typ] & ~selected[typ])[0]: # make them fade
-                # print(np.where(self.selected[typ] & ~selected[typ]))
-                # print(idx)
-                # assert typ_objs is self.objects[typ]
-                # print(typ_objs[idx]['artist'])
+            if self.mode == 'subtract':
+                to_hide = np.where(self.selected[typ] & touched[typ])[0]
+            else:
+                to_hide = np.where(self.selected[typ] & ~touched[typ])[0]
+            for idx in to_hide:
                 typ_objs[idx]['artist'].set_visible(False)
                 self.selected[typ][idx] = False
-        
-        self.fig.canvas.draw()
-        
+
+        self.fig.canvas.draw_idle()
+
+    def onkeypress(self, event):
+        if event.key == 'alt' and self.mode != 'subtract' and self._held_mode is None:
+            self._held_mode = self.mode
+            self._set_mode('subtract')
+
     def onkeyrelease(self, event):
         if event.key == 'm':
-            self.ax.set_title('sorry, not supported yet')
-            plt.pause(1)
-            self.ax.set_title('change [M]ode, [R]estart, or select rectangle')
+            self._held_mode = None
+            self._toggle_mode()
         elif event.key == 'r':
+            self._held_mode = None
             for typ, typ_objs in self.objects.items():
                 self.selected[typ] = np.full(len(typ_objs), True, dtype=bool)
                 for typ_obj in typ_objs:
                     typ_obj['artist'].set_visible(True)
-        self.fig.canvas.draw()
+            self.fig.canvas.draw_idle()
+            self._update_title()
+        elif event.key == 'alt' and self._held_mode is not None:
+            self._set_mode(self._held_mode)
+            self._held_mode = None
             
     def get_filtered_objects(self):
         # print(self.selected)
