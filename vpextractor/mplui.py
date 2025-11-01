@@ -414,9 +414,10 @@ class DataExtractor(BaseEventHandler):
         self.xcals = []
         self.ycals = []
         self.select_rect = None
-        
+
         self.xscale = None
         self.yscale = None
+        self._calibration_suggestions = {'x': None, 'y': None}
         
         self.export_data = {
             'meta': {
@@ -625,6 +626,10 @@ class DataExtractor(BaseEventHandler):
                     self.ca['ylim'] = [rs.y0, rs.y1]
                     
                     self.plot_data()
+                elif event.key == 'f':
+                    for axis in ('x', 'y'):
+                        if self._apply_calibration_suggestion(axis):
+                            break
                 elif event.key == 'u': # duplicate axis
                     for n in '0123456789':
                         if n not in self.axes:
@@ -695,27 +700,32 @@ class DataExtractor(BaseEventHandler):
     def calibrate(self):
         self.xscale = None
         self.yscale = None
+        self._calibration_suggestions['x'] = None
+        self._calibration_suggestions['y'] = None
+        error_messages = []
         # calibrate axes
         try:
             xs, xds = self.ca['x_cal']['pos'], self.ca['x_cal']['data']
             self.xk, self.xb, self.xscale = self.__class__.get_coeffs_auto(xs, xds)
             print(f'calibration: got {self.xk} x + {self.xb}, {self.xscale} scale')
         except ConsistencyError:
-            errmsg = f'inconsistent calibration for x axis: {xs}, {xds}'
-            self.fig.suptitle(f'ERROR: {errmsg}\nclick on calibration line to edit')
-            print(errmsg)
-            self.fig.canvas.draw()
+            errmsg = self._handle_calibration_failure('x', xs, xds)
+            error_messages.append(errmsg)
         try:
             ys, yds = self.ca['y_cal']['pos'], self.ca['y_cal']['data']
             self.yk, self.yb, self.yscale = self.__class__.get_coeffs_auto(ys, yds)
             print(f'calibration: got {self.yk} y + {self.yb}, {self.yscale} scale')
             # print(self.yk, self.yb, self.yscale)
         except ConsistencyError:
-            # print(ys, yds)
-            errmsg = f'inconsistent calibration for y axis: {ys}, {yds}'
-            self.fig.suptitle(f'ERROR: {errmsg}\nclick on calibration line to edit')
-            print(errmsg)
+            errmsg = self._handle_calibration_failure('y', ys, yds)
+            error_messages.append(errmsg)
+
+        if error_messages:
+            errmsg = '\n'.join(error_messages)
+            self.fig.suptitle(f'ERROR: {errmsg}')
             self.fig.canvas.draw()
+        else:
+            self.set_status(self.status)
            
     scale_func = {
         'linear': lambda x: x,
@@ -753,6 +763,96 @@ class DataExtractor(BaseEventHandler):
                 
         else:
             raise ConsistencyError(f"inconsistent data: {xs} and {xds}")
+
+    def _handle_calibration_failure(self, axis, xs, xds):
+        errmsg = f'inconsistent calibration for {axis} axis: {xs}, {xds}'
+        suggestion = self._compute_calibration_suggestion(axis, xs, xds)
+        self._calibration_suggestions[axis] = suggestion
+        if suggestion is not None:
+            idx = suggestion['index'] + 1
+            current = suggestion['current']
+            proposed = suggestion['suggested']
+            delta = proposed - current
+            scale = suggestion['scale']
+            suggestion_msg = (f"Suggested {axis}-axis tick #{idx}: {current:.6g} → "
+                              f"{proposed:.6g} (Δ={delta:.2g}, scale={scale}). "
+                              "Press [F] to apply.")
+            full_msg = f"{errmsg}\n{suggestion_msg}"
+        else:
+            suggestion_msg = 'click on calibration line to edit'
+            full_msg = f"{errmsg}\n{suggestion_msg}"
+        print(full_msg)
+        return full_msg
+
+    def _compute_calibration_suggestion(self, axis, xs, xds):
+        xs = np.asarray(xs, dtype=float)
+        xds = np.asarray(xds, dtype=float)
+        if xs.size < 2:
+            return None
+
+        best = None
+        for scale, xfunc in self.scale_func.items():
+            if scale == 'log' and np.any(xds <= 0):
+                continue
+            try:
+                transformed = xfunc(xds)
+            except (FloatingPointError, ValueError):
+                continue
+            if not np.all(np.isfinite(transformed)):
+                continue
+            A = np.vstack([xs, np.ones_like(xs)]).T
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(A, transformed, rcond=None)
+            except np.linalg.LinAlgError:
+                continue
+            fitted = A @ coeffs
+            residuals = transformed - fitted
+            rms = np.sqrt(np.mean(residuals**2))
+            idx = int(np.argmax(np.abs(residuals)))
+            suggested_value = self.scale_inv_func[scale](fitted[idx])
+            suggested_value = np.asarray(suggested_value)
+            if suggested_value.size != 1:
+                try:
+                    suggested_value = float(suggested_value.item())
+                except ValueError:
+                    continue
+            else:
+                suggested_value = float(suggested_value)
+            if scale == 'log' and suggested_value <= 0:
+                continue
+            suggestion = {
+                'axis': axis,
+                'scale': scale,
+                'index': idx,
+                'current': float(xds[idx]),
+                'suggested': suggested_value,
+                'residual': float(residuals[idx]),
+                'rms': float(rms),
+            }
+            if best is None or suggestion['rms'] < best['rms']:
+                best = suggestion
+        return best
+
+    def _apply_calibration_suggestion(self, axis):
+        suggestion = self._calibration_suggestions.get(axis)
+        if suggestion is None:
+            return False
+        idx = suggestion['index']
+        new_value = suggestion['suggested']
+        cal_key = f'{axis}_cal'
+        self.ca[cal_key]['data'][idx] = new_value
+        if axis == 'x':
+            if idx < len(self.xcals) and 'vtext' in self.xcals[idx]:
+                self.xcals[idx]['vtext'].set_text(f'{new_value:.2g}')
+        elif axis == 'y':
+            if idx < len(self.ycals) and 'htext' in self.ycals[idx]:
+                self.ycals[idx]['htext'].set_text(f'{new_value:.2g}')
+        self._calibration_suggestions[axis] = None
+        print(f"applied suggested correction to {axis}-axis tick #{idx + 1}: {new_value:.6g}")
+        self.calibrate()
+        self.plot_data()
+        self.fig.canvas.draw()
+        return True
         
     @staticmethod
     def get_coeffs(x1, x2, xd1, xd2, scale='linear'):
