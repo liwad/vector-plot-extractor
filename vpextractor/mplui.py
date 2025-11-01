@@ -738,29 +738,53 @@ class DataExtractor(BaseEventHandler):
 
     @classmethod
     def get_coeffs_auto(cls, xs, xds, err=1e-5):
-        if len(xs) != len(xds):
+        xs = np.asarray(xs, dtype=float)
+        xds = np.asarray(xds, dtype=float)
+        if xs.size != xds.size:
             raise ValueError('expected xs, xds with the same shape')
-        if len(xs) < 2:
+        if xs.size < 2:
             return None, None, None
-        
+
+        if not (np.all(np.isfinite(xs)) and np.all(np.isfinite(xds))):
+            raise ConsistencyError(f'inconsistent data: {xs} and {xds}')
+
+        dx = np.diff(xs)
+        if np.any(dx == 0):
+            raise ConsistencyError(f'inconsistent data: {xs} and {xds}')
+
         # TODO: support interpolation calibration?
-        # automatically choose linear or log scale, and check consistency 
+        # automatically choose linear or log scale, and check consistency
         for scale, xfunc in cls.scale_func.items():
-            ks = np.diff(xfunc(xds)) / np.diff(xs)
-            
+            if scale == 'log' and np.any(xds <= 0):
+                continue
+            try:
+                transformed = xfunc(xds)
+            except (FloatingPointError, ValueError):
+                continue
+            if not np.all(np.isfinite(transformed)):
+                continue
+            ks = np.diff(transformed) / dx
+            if not np.all(np.isfinite(ks)):
+                continue
+
             # 1: unique
             # k = np.unique(ks)
             # if k.size == 1:
             #     k = k[0]
             #     b = xds[0] - k * xs[0]
             #     return k, b, scale
-                
+
             # 2: allow error
             k = np.mean(ks)
-            if (np.max(ks) - np.min(ks)) / np.abs(k) < err:
-                b = np.mean(xfunc(xds)[:-1] - ks * xs[:-1])
+            if k == 0 or not np.isfinite(k):
+                continue
+            spread = np.max(ks) - np.min(ks)
+            if spread / np.abs(k) < err:
+                b = np.mean(transformed[:-1] - k * xs[:-1])
+                if not np.isfinite(b):
+                    continue
                 return k, b, scale
-                
+
         else:
             raise ConsistencyError(f"inconsistent data: {xs} and {xds}")
 
@@ -851,7 +875,7 @@ class DataExtractor(BaseEventHandler):
         print(f"applied suggested correction to {axis}-axis tick #{idx + 1}: {new_value:.6g}")
         self.calibrate()
         self.plot_data()
-        self.fig.canvas.draw()
+        self.fig.canvas.draw_idle()
         return True
         
     @staticmethod
