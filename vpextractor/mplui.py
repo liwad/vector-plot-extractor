@@ -6,14 +6,14 @@ Created on Thu Jan 18 19:28:30 2024
 """
 
 import numpy as np
-from .filter import select_paths, rect_filter_objects, get_filtered_objects
+from .filter import select_paths, rect_filter_objects, get_filtered_objects, normalize_rect_mode
 from copy import copy, deepcopy
 from .drawing import add, plot_objects, get_color, Line2D
 import matplotlib.pyplot as plt
 from .utils import pause_and_warn, save_pickle, annotate, dedup
 import os
 import json
-from matplotlib.widgets import TextBox
+from matplotlib.widgets import TextBox, Button
 from itertools import chain
 from . import __version__
 
@@ -128,28 +128,44 @@ class RectSelector(BaseEventHandler):
             rect, = ax.plot([], [], linestyle='--', color='r')
             self.rects[ax] = rect
         self.finish = finish
-    
+
     def onpress(self, event):
+        if event.inaxes not in self.rects:
+            self.ax = None
+            return
+
+        if event.xdata is None or event.ydata is None:
+            self.ax = None
+            return
+
         self.finished = False
         self.ax = event.inaxes
         self.x0, self.y0 = event.xdata, event.ydata
-    
+
     def onmove_down(self, event):
         if event.inaxes == self.ax:
             self.x1, self.y1 = event.xdata, event.ydata
-            
+
             x, y  = self.get_xydata()
             self.rects[self.ax].set_data(x, y)
             self.rects[self.ax].set_marker('')
             self.fig.canvas.draw()
             
     def onrelease(self, event):
-        self.x0, self.x1 = np.sort((self.x0, self.x1))
-        self.y0, self.y1 = np.sort((self.y0, self.y1))
+        if self.ax is None or self.ax not in self.rects:
+            return
+
+        x1 = getattr(self, 'x1', self.x0)
+        y1 = getattr(self, 'y1', self.y0)
+
+        self.x0, x1 = np.sort((self.x0, x1))
+        self.y0, y1 = np.sort((self.y0, y1))
+        self.x1, self.y1 = x1, y1
+
         self.rects[self.ax].set_marker('s')
         self.fig.canvas.draw()
-        
-        if self.finish: 
+
+        if self.finish:
             self.finished = True
         
     def get_xydata(self, closed=True):
@@ -339,60 +355,128 @@ class ElementIdentifier(BaseEventHandler):
         return types, known_markers
     
 class RectObjectSelector(RectSelector):
+    MODE_STYLES = {
+        'touch': {'title': 'Keep touched objects', 'color': '#2ca02c'},
+        'subtract': {'title': 'Remove touched objects', 'color': '#d62728'},
+    }
+
     def init(self, objects, ax=None, mode='touch'):
-        # modes: 
-        #     'touch': if any part of the group of object in this region (in other words, if the rectangle "touches" the object), select
-        
-        super().init()
-        self.objects = objects
+        super().init(finish=False)
         if ax is None:
-            ax = self.fig.ax
-        self.ax = ax
+            ax = getattr(self.fig, 'ax', None)
+            if ax is None:
+                if not self.fig.axes:
+                    raise ValueError('expected an Axes for RectObjectSelector')
+                ax = self.fig.axes[0]
+
+        self.display_ax = ax
         self.objects = deepcopy(objects)
         self.orig_objects = objects
         self.selected = {}
         for typ, typ_objs in objects.items():
             self.selected[typ] = np.full(len(typ_objs), True, dtype=bool)
-        
-        self.mode = mode
-        
-        plot_objects((self.objects))
-        
-        self.ax.set_title('change [M]ode, [R]estart, or select rectangle')
-        
+
+        self._held_mode = None
+        self.mode = None
+        self._finish_button = None
+
+        plot_objects(self.objects, ax=self.display_ax)
+
+        self._set_mode(mode)
+        self._add_finish_button()
+
+    def _add_finish_button(self):
+        bbox = self.display_ax.get_position()
+        width = 0.12
+        height = 0.05
+        margin = 0.02
+        x = max(margin, min(bbox.x1 - width, 1 - width - margin))
+        y = max(margin, bbox.y0 - height - margin)
+        self._finish_button_ax = self.fig.add_axes([x, y, width, height])
+        self._finish_button = Button(self._finish_button_ax, 'Done')
+        self._finish_button.on_clicked(self._finish_selection)
+        self._finish_button_ax._selector_ignore = True  # prevent picking up drag events
+
+    def _set_mode(self, mode, *, force=False):
+        normalized = normalize_rect_mode(mode)
+        if not force and normalized == self.mode:
+            return
+
+        self.mode = normalized
+        style = self.MODE_STYLES[self.mode]
+        for rect in self.rects.values():
+            rect.set_color(style['color'])
+        self._update_title()
+
+    def _update_title(self):
+        style = self.MODE_STYLES[self.mode]
+        if self.mode == 'touch':
+            hint = 'Press [M] to remove, hold Alt to temporarily remove, [R] to reset.'
+        else:
+            hint = 'Press [M] to keep instead, [R] to reset.'
+        hint += ' Click Done or press Enter when finished.'
+        self.display_ax.set_title(f"Mode: {style['title']}. {hint}")
+        self.fig.canvas.draw_idle()
+
+    def _toggle_mode(self):
+        next_mode = 'subtract' if self.mode != 'subtract' else 'touch'
+        self._set_mode(next_mode)
+
     def onrelease(self, event):
         super().onrelease(event)
-        
-        selected = rect_filter_objects(self.objects, self.x0, self.x1, self.y0, self.y1, mode=self.mode)
-        self.last_selected = selected
-        # print(selected)
-        
+
+        if self.ax is None:
+            return
+
+        touched = rect_filter_objects(self.objects, self.x0, self.x1, self.y0, self.y1, mode=self.mode)
+        self.last_selected = touched
+
         for typ, typ_objs in self.objects.items():
-            for idx in np.where(self.selected[typ] & ~selected[typ])[0]: # make them fade
-                # print(np.where(self.selected[typ] & ~selected[typ]))
-                # print(idx)
-                # assert typ_objs is self.objects[typ]
-                # print(typ_objs[idx]['artist'])
+            if self.mode == 'subtract':
+                to_hide = np.where(self.selected[typ] & touched[typ])[0]
+            else:
+                to_hide = np.where(self.selected[typ] & ~touched[typ])[0]
+            for idx in to_hide:
                 typ_objs[idx]['artist'].set_visible(False)
                 self.selected[typ][idx] = False
-        
-        self.fig.canvas.draw()
-        
+
+        self.fig.canvas.draw_idle()
+
+    def onkeypress(self, event):
+        if event.key == 'alt' and self.mode != 'subtract' and self._held_mode is None:
+            self._held_mode = self.mode
+            self._set_mode('subtract')
+
     def onkeyrelease(self, event):
         if event.key == 'm':
-            self.ax.set_title('sorry, not supported yet')
-            plt.pause(1)
-            self.ax.set_title('change [M]ode, [R]estart, or select rectangle')
+            self._held_mode = None
+            self._toggle_mode()
         elif event.key == 'r':
+            self._held_mode = None
             for typ, typ_objs in self.objects.items():
                 self.selected[typ] = np.full(len(typ_objs), True, dtype=bool)
                 for typ_obj in typ_objs:
                     typ_obj['artist'].set_visible(True)
-        self.fig.canvas.draw()
-            
+            self.fig.canvas.draw_idle()
+            self._update_title()
+        elif event.key == 'alt' and self._held_mode is not None:
+            self._set_mode(self._held_mode)
+            self._held_mode = None
+        elif event.key in ('enter', 'return'):
+            self._finish_selection()
+
     def get_filtered_objects(self):
         # print(self.selected)
         return get_filtered_objects(self.orig_objects, self.selected)
+
+    def _finish_selection(self, _event=None):
+        if self.finished:
+            return
+
+        self.finished = True
+        self.display_ax.set_title('Selection complete. Close window to continue.')
+        self.fig.canvas.draw_idle()
+        plt.close(self.fig)
     
     
 class DataExtractor(BaseEventHandler):
@@ -414,9 +498,10 @@ class DataExtractor(BaseEventHandler):
         self.xcals = []
         self.ycals = []
         self.select_rect = None
-        
+
         self.xscale = None
         self.yscale = None
+        self._calibration_suggestions = {'x': None, 'y': None}
         
         self.export_data = {
             'meta': {
@@ -625,6 +710,10 @@ class DataExtractor(BaseEventHandler):
                     self.ca['ylim'] = [rs.y0, rs.y1]
                     
                     self.plot_data()
+                elif event.key == 'f':
+                    for axis in ('x', 'y'):
+                        if self._apply_calibration_suggestion(axis):
+                            break
                 elif event.key == 'u': # duplicate axis
                     for n in '0123456789':
                         if n not in self.axes:
@@ -695,27 +784,32 @@ class DataExtractor(BaseEventHandler):
     def calibrate(self):
         self.xscale = None
         self.yscale = None
+        self._calibration_suggestions['x'] = None
+        self._calibration_suggestions['y'] = None
+        error_messages = []
         # calibrate axes
         try:
             xs, xds = self.ca['x_cal']['pos'], self.ca['x_cal']['data']
             self.xk, self.xb, self.xscale = self.__class__.get_coeffs_auto(xs, xds)
             print(f'calibration: got {self.xk} x + {self.xb}, {self.xscale} scale')
         except ConsistencyError:
-            errmsg = f'inconsistent calibration for x axis: {xs}, {xds}'
-            self.fig.suptitle(f'ERROR: {errmsg}\nclick on calibration line to edit')
-            print(errmsg)
-            self.fig.canvas.draw()
+            errmsg = self._handle_calibration_failure('x', xs, xds)
+            error_messages.append(errmsg)
         try:
             ys, yds = self.ca['y_cal']['pos'], self.ca['y_cal']['data']
             self.yk, self.yb, self.yscale = self.__class__.get_coeffs_auto(ys, yds)
             print(f'calibration: got {self.yk} y + {self.yb}, {self.yscale} scale')
             # print(self.yk, self.yb, self.yscale)
         except ConsistencyError:
-            # print(ys, yds)
-            errmsg = f'inconsistent calibration for y axis: {ys}, {yds}'
-            self.fig.suptitle(f'ERROR: {errmsg}\nclick on calibration line to edit')
-            print(errmsg)
+            errmsg = self._handle_calibration_failure('y', ys, yds)
+            error_messages.append(errmsg)
+
+        if error_messages:
+            errmsg = '\n'.join(error_messages)
+            self.fig.suptitle(f'ERROR: {errmsg}')
             self.fig.canvas.draw()
+        else:
+            self.set_status(self.status)
            
     scale_func = {
         'linear': lambda x: x,
@@ -728,31 +822,145 @@ class DataExtractor(BaseEventHandler):
 
     @classmethod
     def get_coeffs_auto(cls, xs, xds, err=1e-5):
-        if len(xs) != len(xds):
+        xs = np.asarray(xs, dtype=float)
+        xds = np.asarray(xds, dtype=float)
+        if xs.size != xds.size:
             raise ValueError('expected xs, xds with the same shape')
-        if len(xs) < 2:
+        if xs.size < 2:
             return None, None, None
-        
+
+        if not (np.all(np.isfinite(xs)) and np.all(np.isfinite(xds))):
+            raise ConsistencyError(f'inconsistent data: {xs} and {xds}')
+
+        dx = np.diff(xs)
+        if np.any(dx == 0):
+            raise ConsistencyError(f'inconsistent data: {xs} and {xds}')
+
         # TODO: support interpolation calibration?
-        # automatically choose linear or log scale, and check consistency 
+        # automatically choose linear or log scale, and check consistency
         for scale, xfunc in cls.scale_func.items():
-            ks = np.diff(xfunc(xds)) / np.diff(xs)
-            
+            if scale == 'log' and np.any(xds <= 0):
+                continue
+            try:
+                transformed = xfunc(xds)
+            except (FloatingPointError, ValueError):
+                continue
+            if not np.all(np.isfinite(transformed)):
+                continue
+            ks = np.diff(transformed) / dx
+            if not np.all(np.isfinite(ks)):
+                continue
+
             # 1: unique
             # k = np.unique(ks)
             # if k.size == 1:
             #     k = k[0]
             #     b = xds[0] - k * xs[0]
             #     return k, b, scale
-                
+
             # 2: allow error
             k = np.mean(ks)
-            if (np.max(ks) - np.min(ks)) / np.abs(k) < err:
-                b = np.mean(xfunc(xds)[:-1] - ks * xs[:-1])
+            if k == 0 or not np.isfinite(k):
+                continue
+            spread = np.max(ks) - np.min(ks)
+            if spread / np.abs(k) < err:
+                b = np.mean(transformed[:-1] - k * xs[:-1])
+                if not np.isfinite(b):
+                    continue
                 return k, b, scale
-                
+
         else:
             raise ConsistencyError(f"inconsistent data: {xs} and {xds}")
+
+    def _handle_calibration_failure(self, axis, xs, xds):
+        errmsg = f'inconsistent calibration for {axis} axis: {xs}, {xds}'
+        suggestion = self._compute_calibration_suggestion(axis, xs, xds)
+        self._calibration_suggestions[axis] = suggestion
+        if suggestion is not None:
+            idx = suggestion['index'] + 1
+            current = suggestion['current']
+            proposed = suggestion['suggested']
+            delta = proposed - current
+            scale = suggestion['scale']
+            suggestion_msg = (f"Suggested {axis}-axis tick #{idx}: {current:.6g} → "
+                              f"{proposed:.6g} (Δ={delta:.2g}, scale={scale}). "
+                              "Press [F] to apply.")
+            full_msg = f"{errmsg}\n{suggestion_msg}"
+        else:
+            suggestion_msg = 'click on calibration line to edit'
+            full_msg = f"{errmsg}\n{suggestion_msg}"
+        print(full_msg)
+        return full_msg
+
+    def _compute_calibration_suggestion(self, axis, xs, xds):
+        xs = np.asarray(xs, dtype=float)
+        xds = np.asarray(xds, dtype=float)
+        if xs.size < 2:
+            return None
+
+        best = None
+        for scale, xfunc in self.scale_func.items():
+            if scale == 'log' and np.any(xds <= 0):
+                continue
+            try:
+                transformed = xfunc(xds)
+            except (FloatingPointError, ValueError):
+                continue
+            if not np.all(np.isfinite(transformed)):
+                continue
+            A = np.vstack([xs, np.ones_like(xs)]).T
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(A, transformed, rcond=None)
+            except np.linalg.LinAlgError:
+                continue
+            fitted = A @ coeffs
+            residuals = transformed - fitted
+            rms = np.sqrt(np.mean(residuals**2))
+            idx = int(np.argmax(np.abs(residuals)))
+            suggested_value = self.scale_inv_func[scale](fitted[idx])
+            suggested_value = np.asarray(suggested_value)
+            if suggested_value.size != 1:
+                try:
+                    suggested_value = float(suggested_value.item())
+                except ValueError:
+                    continue
+            else:
+                suggested_value = float(suggested_value)
+            if scale == 'log' and suggested_value <= 0:
+                continue
+            suggestion = {
+                'axis': axis,
+                'scale': scale,
+                'index': idx,
+                'current': float(xds[idx]),
+                'suggested': suggested_value,
+                'residual': float(residuals[idx]),
+                'rms': float(rms),
+            }
+            if best is None or suggestion['rms'] < best['rms']:
+                best = suggestion
+        return best
+
+    def _apply_calibration_suggestion(self, axis):
+        suggestion = self._calibration_suggestions.get(axis)
+        if suggestion is None:
+            return False
+        idx = suggestion['index']
+        new_value = suggestion['suggested']
+        cal_key = f'{axis}_cal'
+        self.ca[cal_key]['data'][idx] = new_value
+        if axis == 'x':
+            if idx < len(self.xcals) and 'vtext' in self.xcals[idx]:
+                self.xcals[idx]['vtext'].set_text(f'{new_value:.2g}')
+        elif axis == 'y':
+            if idx < len(self.ycals) and 'htext' in self.ycals[idx]:
+                self.ycals[idx]['htext'].set_text(f'{new_value:.2g}')
+        self._calibration_suggestions[axis] = None
+        print(f"applied suggested correction to {axis}-axis tick #{idx + 1}: {new_value:.6g}")
+        self.calibrate()
+        self.plot_data()
+        self.fig.canvas.draw_idle()
+        return True
         
     @staticmethod
     def get_coeffs(x1, x2, xd1, xd2, scale='linear'):
