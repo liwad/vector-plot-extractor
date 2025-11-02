@@ -10,9 +10,6 @@ helper functions for filtering out not useful elements
 import numpy as np
 from itertools import repeat, islice
 
-DEFAULT_SHAPE_TOL = 1e-2
-DEFAULT_COLOR_TOL = 5e-3
-
 _RECT_MODE_ALIASES = {
     'touch': 'touch',
     'keep': 'touch',
@@ -53,7 +50,7 @@ def normalize_rect_mode(mode):
     except KeyError as exc:
         raise ValueError(f'unknown rect filter mode {mode!r}') from exc
 
-def eq(ar0, ar1, eta=DEFAULT_SHAPE_TOL):
+def eq(ar0, ar1, eta=1e-2):
     ar0 = np.array(ar0)
     ar1 = np.array(ar1)
     if ar0.shape != ar1.shape:
