@@ -274,6 +274,50 @@ class ElementIdentifier(BaseEventHandler):
             bool(feature.get('closed', False)),
         )
 
+    def _geometry_signature(self, feature):
+        rel_pos = np.asarray(feature['rel_pos'], dtype=np.float64)
+        extent = tuple(np.round(np.asarray(feature.get('extent', (0.0, 0.0)), dtype=np.float64), 6))
+        bbox = tuple(np.round(np.asarray(feature.get('bbox', (0.0, 0.0, 0.0, 0.0)), dtype=np.float64), 6))
+        return (
+            feature.get('type'),
+            rel_pos.tobytes(),
+            feature.get('artist_class'),
+            extent,
+            bbox,
+            bool(feature.get('closed', False)),
+        )
+
+    def _color_contrast(self, value):
+        if value is None:
+            return 0.0
+        arr = np.asarray(value, dtype=float)
+        if arr.size == 0:
+            return 0.0
+        arr = arr.ravel()
+        if arr.size < 3 or not np.all(np.isfinite(arr[:3])):
+            return 0.0
+        rgb = arr[:3]
+        alpha = arr[3] if arr.size > 3 and np.isfinite(arr[3]) else 1.0
+        alpha = float(max(alpha, 0.0))
+        contrast = float(np.linalg.norm(rgb - 1.0))
+        return alpha * contrast
+
+    def _style_score(self, feature):
+        color_score = self._color_contrast(feature.get('color'))
+        fill_score = self._color_contrast(feature.get('fill'))
+        return max(color_score, 0.75 * fill_score)
+
+    def _choose_geometry_representative(self, base_indices, path_features):
+        best_idx = None
+        best_score = -np.inf
+        for idx in base_indices:
+            feature = path_features[idx]
+            score = self._style_score(feature)
+            if best_idx is None or score > best_score + 1e-12:
+                best_idx = idx
+                best_score = score
+        return best_idx if best_idx is not None else base_indices[0]
+
     def _prepare_artists(self, artists, artists_in_plot, path_features):
         signature_map = OrderedDict()
         for idx, feature in enumerate(path_features):
@@ -282,29 +326,65 @@ class ElementIdentifier(BaseEventHandler):
 
         base_indices = []
         duplicate_lookup = {}
-        hidden = 0
+
         for group in signature_map.values():
             base_idx = group[0]
             base_indices.append(base_idx)
-            duplicate_lookup[base_idx] = tuple(group)
-            hidden += len(group) - 1
+            dupset = duplicate_lookup.setdefault(base_idx, set())
+            for dup_idx in group:
+                dupset.add(dup_idx)
             for dup_idx in group[1:]:
-                artists_in_plot[dup_idx].remove()
+                preview_artist = artists_in_plot[dup_idx]
+                if getattr(preview_artist, 'axes', None) is not None:
+                    preview_artist.remove()
 
-        unique_artists = [artists[i] for i in base_indices]
-        unique_features = [path_features[i] for i in base_indices]
+        geometry_groups = OrderedDict()
+        for base_idx in base_indices:
+            feature = path_features[base_idx]
+            geometry_signature = self._geometry_signature(feature)
+            geometry_groups.setdefault(geometry_signature, []).append(base_idx)
+
+        final_indices = []
+        for group in geometry_groups.values():
+            if len(group) == 1:
+                representative = group[0]
+            else:
+                representative = self._choose_geometry_representative(group, path_features)
+            final_indices.append(representative)
+            duplicate_lookup.setdefault(representative, set()).add(representative)
+            for idx in group:
+                if idx == representative:
+                    continue
+                preview_artist = artists_in_plot[idx]
+                if getattr(preview_artist, 'axes', None) is not None:
+                    preview_artist.remove()
+                duplicate_lookup.setdefault(representative, set()).update(duplicate_lookup.get(idx, {idx}))
+                if idx in duplicate_lookup and idx != representative:
+                    duplicate_lookup.pop(idx, None)
+
+        unique_artists = [artists[i] for i in final_indices]
+        unique_features = [path_features[i] for i in final_indices]
         unique_plot_artists = []
-        for i in base_indices:
+        for i in final_indices:
             preview_artist = artists_in_plot[i]
             self._tweak_artist_for_preview(preview_artist)
             unique_plot_artists.append(preview_artist)
+
+        normalized_lookup = {}
+        for idx in final_indices:
+            members = duplicate_lookup.get(idx, {idx})
+            if not isinstance(members, set):
+                members = set(members)
+            normalized_lookup[idx] = tuple(sorted(members))
+
+        hidden = len(path_features) - len(final_indices)
 
         return {
             'artists': unique_artists,
             'artists_in_plot': unique_plot_artists,
             'path_features': unique_features,
-            'base_indices': base_indices,
-            'duplicate_lookup': duplicate_lookup,
+            'base_indices': final_indices,
+            'duplicate_lookup': normalized_lookup,
             'hidden': hidden,
             'original_count': len(path_features),
         }
