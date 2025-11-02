@@ -17,8 +17,12 @@ import matplotlib.pyplot as plt
 import warnings
 from copy import copy, deepcopy
 from itertools import chain
-from .filter import select_paths
+from . import filter as _filter
 from .utils import dedup
+
+select_paths = _filter.select_paths
+DEFAULT_SHAPE_TOL = getattr(_filter, 'DEFAULT_SHAPE_TOL', 1e-2)
+DEFAULT_COLOR_TOL = getattr(_filter, 'DEFAULT_COLOR_TOL', 5e-3)
 
 def add(ax, artist):
     # add artist to ax given different types
@@ -47,6 +51,39 @@ def get_color(artist):
         raise TypeError(type(artist))
 
 
+def optimize_artist_for_preview(artist, lw_limits=(0.3, 2.5), markersize_limit=12):
+    lw_min, lw_max = lw_limits
+
+    if isinstance(artist, Line2D):
+        lw = artist.get_linewidth()
+        if np.isfinite(lw):
+            artist.set_linewidth(min(max(lw, lw_min), lw_max))
+        ms = artist.get_markersize()
+        if np.isfinite(ms):
+            artist.set_markersize(min(ms, markersize_limit))
+    elif isinstance(artist, Patch):
+        lw = artist.get_linewidth()
+        if lw is not None and np.isfinite(lw):
+            artist.set_linewidth(min(max(lw, lw_min), lw_max))
+    elif isinstance(artist, LineCollection):
+        lws = artist.get_linewidths()
+        if lws is not None and len(lws):
+            artist.set_linewidths(np.clip(lws, lw_min, lw_max))
+    elif isinstance(artist, PatchCollection):
+        lws = artist.get_linewidths()
+        if lws is not None and len(lws):
+            artist.set_linewidths(np.clip(lws, lw_min, lw_max))
+    elif isinstance(artist, PathCollection):
+        sizes = artist.get_sizes()
+        if sizes is not None and len(sizes):
+            artist.set_sizes(np.minimum(sizes, markersize_limit ** 2))
+        lws = artist.get_linewidths()
+        if lws is not None and len(lws):
+            artist.set_linewidths(np.clip(lws, lw_min, lw_max))
+
+    return artist
+
+
 def split_broken_paths(paths):
     split_paths = []
     for path in paths:
@@ -56,8 +93,11 @@ def split_broken_paths(paths):
                 new_path = deepcopy(path)
                 new_path['items'] = [path['items'][j] for j in item_idx]
                 new_path['seqno'] = path['seqno'] + i  # make it distinct
+                new_path['closePath'] = _infer_close_path(new_path['items'], path.get('closePath', False))
                 split_paths.append(new_path)
         else:
+            if path['items']:
+                path['closePath'] = _infer_close_path(path['items'], path.get('closePath', False))
             split_paths.append(path)
     return split_paths
 
@@ -142,11 +182,23 @@ def parse_path(path, split_broken=True):
     x, y = np.array(x), np.array(y)
     rel_pt = np.argmin(x)
     x_rel, y_rel = x[rel_pt], y[rel_pt]
+    x_min, x_max = np.min(x), np.max(x)
+    y_min, y_max = np.min(y), np.max(y)
+
+    has_stroke = 's' in path['type'] and (path.get('stroke_opacity', 1) or 0) > 0
+    has_fill = 'f' in path['type'] and (path.get('fill_opacity', 1) or 0) > 0
+
     path_feature = { # features of the path used to identify similar paths
         'rel_pos': np.array([x - x_rel, y - y_rel]), # relative positions
         'type': '+'.join(item_type),
         'color': np.array(path['color']),
         'fill': np.array(path['fill']),
+        'bbox': np.array([x_min, y_min, x_max, y_max]),
+        'extent': np.array([x_max - x_min, y_max - y_min]),
+        'artist_class': artist.__class__.__name__,
+        'closed': bool(path['closePath']),
+        'has_stroke': bool(has_stroke),
+        'has_fill': bool(has_fill),
         }
     
     artist.set_picker(True)
@@ -174,12 +226,12 @@ def plot_path(path, ax=None):
 def plot_paths(paths, ax=None):
     if ax is None:
         ax = plt.gca()
-        
+
     artists = [] # the original artists
     artists_in_plot = [] # the artists made in plot (once an artist is added, it can never be added to somewhere else)
     path_features = []
     unrecognized_paths = []
-    for path in paths:
+    for path in split_broken_paths(paths):
         try:
             item_type, coords, artist, path_feature = parse_path(path)
         except ValueError:
@@ -209,6 +261,21 @@ def get_coords(items, split_broken=True):
     x, y = None, None
     item_idx = [[]]
     for itemi, item in enumerate(items):
+        code = item[0]
+        if code == 're':  # rectangles should always live in their own group
+            rect = item[1]
+            if xs[-1]:
+                xs.append([])
+                ys.append([])
+                item_idx.append([])
+            xs[-1] += [rect.x0, rect.x1, rect.x1, rect.x0, rect.x0]
+            ys[-1] += [rect.y0, rect.y0, rect.y1, rect.y1, rect.y0]
+            item_idx[-1].append(itemi)
+            x, y = rect.x0, rect.y0
+            xs.append([])
+            ys.append([])
+            item_idx.append([])
+            continue
         if item[0] == 'c': # Bezier curve
             pts = item[1:]
             if len(pts) == 4: # cubic
@@ -216,11 +283,6 @@ def get_coords(items, split_broken=True):
             else:
                 raise NotImplementedError()
             
-        elif item[0] == 're': #rectangle
-            rect = item[1]
-            x0, x1, y0, y1 = rect.x0, rect.x1, rect.y0, rect.y1
-            xs[-1] += [x0, x1, x1, x0, x0]
-            ys[-1] += [y0, y0, y1, y1, y0]
         elif item[0] == 'qu': # quad
             quad = item[1]
             pts = [quad.ul, quad.ur, quad.lr, quad.ll]
@@ -228,7 +290,7 @@ def get_coords(items, split_broken=True):
             pts = item[1:]
         else:
             raise NotImplementedError()
-            
+
         if item[0] in ['c', 'qu', 'l']:
             for pti, pt in enumerate(pts):
                 if (x, y) == (pt.x, pt.y): # same location as the last point
@@ -244,11 +306,31 @@ def get_coords(items, split_broken=True):
                 xs[-1].append(x)
                 ys[-1].append(y)
         item_idx[-1].append(itemi)
-    
+
     if not split_broken:
+        if xs and not xs[-1]:
+            xs = xs[:-1]
+            ys = ys[:-1]
         return (list(chain(*xs)), list(chain(*ys))), None
-    
+
+    if xs and not xs[-1]:
+        xs = xs[:-1]
+        ys = ys[:-1]
+        item_idx = item_idx[:-1]
+
     return [xs, ys], item_idx
+
+
+def _infer_close_path(items, default=False):
+    for item in items:
+        if item[0] in {'re', 'qu'}:
+            return True
+
+    (xs, ys), _ = get_coords(items, split_broken=False)
+    if xs and ys and (xs[0], ys[0]) == (xs[-1], ys[-1]):
+        return True
+
+    return bool(default)
 
 def get_curv_path(items):
     # get matplotlib.path.Path object
@@ -324,6 +406,8 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
             raise ValueError('expected argument "markers" for "mode=typestr"')
         marker_features = [marker['feature'] for marker in markers]
         match_modes = [marker['match_by'] for marker in markers]
+        marker_shape_tols = [marker.get('shape_tol', DEFAULT_SHAPE_TOL) for marker in markers]
+        marker_color_tols = [marker.get('color_tol', DEFAULT_COLOR_TOL) for marker in markers]
         objects = {
             'u': [], # undefined
             's': [], # scatter
@@ -344,7 +428,13 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
                 continue
 
             if typ == 's':
-                idx = select_paths(path_feature, marker_features, match_modes)
+                idx = select_paths(
+                    path_feature,
+                    marker_features,
+                    match_modes,
+                    pos_tol=marker_shape_tols,
+                    color_tol=marker_color_tols,
+                )
                 # if len(idx) != 1:
                 #     pass
                 assert len(idx) == 1, idx
@@ -393,16 +483,19 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
     
     return objects
 
-def plot_objects(objects, ax=None):
+def plot_objects(objects, ax=None, *, optimize_preview=False):
     # plot grouped objects
-    
+
     if ax is None:
         ax = plt.gca()
-    
+
     for typ, typ_objs in objects.items():
         for obj in typ_objs:
-            add(ax, obj['artist'])
-            
+            artist = obj['artist']
+            if optimize_preview:
+                optimize_artist_for_preview(artist)
+            add(ax, artist)
+
     ax.autoscale()
     ax.invert_yaxis()
 
