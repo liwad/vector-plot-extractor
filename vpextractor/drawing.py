@@ -142,11 +142,23 @@ def parse_path(path, split_broken=True):
     x, y = np.array(x), np.array(y)
     rel_pt = np.argmin(x)
     x_rel, y_rel = x[rel_pt], y[rel_pt]
+    x_min, x_max = np.min(x), np.max(x)
+    y_min, y_max = np.min(y), np.max(y)
+
+    has_stroke = 's' in path['type'] and (path.get('stroke_opacity', 1) or 0) > 0
+    has_fill = 'f' in path['type'] and (path.get('fill_opacity', 1) or 0) > 0
+
     path_feature = { # features of the path used to identify similar paths
         'rel_pos': np.array([x - x_rel, y - y_rel]), # relative positions
         'type': '+'.join(item_type),
         'color': np.array(path['color']),
         'fill': np.array(path['fill']),
+        'bbox': np.array([x_min, y_min, x_max, y_max]),
+        'extent': np.array([x_max - x_min, y_max - y_min]),
+        'artist_class': artist.__class__.__name__,
+        'closed': bool(path['closePath']),
+        'has_stroke': bool(has_stroke),
+        'has_fill': bool(has_fill),
         }
     
     artist.set_picker(True)
