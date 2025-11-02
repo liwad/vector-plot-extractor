@@ -734,12 +734,15 @@ class ElementIdentifier(BaseEventHandler):
             return matched_idxs
         base_extent = self.path_feature.get('extent')
         base_artist_class = self.path_feature.get('artist_class')
+        match_mode = getattr(self, 'match_mode', None)
+        skip_extent_check = match_mode in ('s', 'l')
         filtered = []
         for idx in matched_idxs:
             feature = self.path_features[idx]
             if base_artist_class and feature.get('artist_class') != base_artist_class:
                 continue
-            if base_extent is not None and feature.get('extent') is not None:
+            if (not skip_extent_check and
+                    base_extent is not None and feature.get('extent') is not None):
                 if not self._extent_compatible(base_extent, feature.get('extent')):
                     continue
             filtered.append(idx)

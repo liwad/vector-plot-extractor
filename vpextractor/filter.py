@@ -61,7 +61,7 @@ def eq(ar0, ar1, eta=None):
     if ar0.shape != ar1.shape:
         return False
     else:
-        return np.all(np.abs(ar0 - ar1) < eta)
+        return np.all(np.abs(ar0 - ar1) <= eta)
 
 
 def color_eq(col0, col1, eta=None):
