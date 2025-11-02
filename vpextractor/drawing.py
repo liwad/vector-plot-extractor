@@ -17,8 +17,12 @@ import matplotlib.pyplot as plt
 import warnings
 from copy import copy, deepcopy
 from itertools import chain
-from .filter import select_paths, DEFAULT_SHAPE_TOL, DEFAULT_COLOR_TOL
+from . import filter as _filter
 from .utils import dedup
+
+select_paths = _filter.select_paths
+DEFAULT_SHAPE_TOL = getattr(_filter, 'DEFAULT_SHAPE_TOL', 1e-2)
+DEFAULT_COLOR_TOL = getattr(_filter, 'DEFAULT_COLOR_TOL', 5e-3)
 
 def add(ax, artist):
     # add artist to ax given different types

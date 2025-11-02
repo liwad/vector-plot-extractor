@@ -10,46 +10,6 @@ helper functions for filtering out not useful elements
 import numpy as np
 from itertools import repeat, islice
 
-_RECT_MODE_ALIASES = {
-    'touch': 'touch',
-    'keep': 'touch',
-    'include': 'touch',
-    'intersect': 'touch',
-    'subtract': 'subtract',
-    'remove': 'subtract',
-    'exclude': 'subtract',
-}
-
-
-def normalize_rect_mode(mode):
-    """Normalize region filtering mode names.
-
-    Parameters
-    ----------
-    mode : str or None
-        User supplied mode name. Accepts a handful of aliases so callers can
-        use descriptive terms without worrying about the canonical value.
-
-    Returns
-    -------
-    str
-        Either ``'touch'`` (keep only objects that overlap with the rectangle)
-        or ``'subtract'`` (remove overlapped objects).
-    """
-
-    if mode is None:
-        key = 'touch'
-    else:
-        try:
-            key = str(mode).lower()
-        except Exception as exc:
-            raise ValueError(f'unknown rect filter mode {mode!r}') from exc
-
-    try:
-        return _RECT_MODE_ALIASES[key]
-    except KeyError as exc:
-        raise ValueError(f'unknown rect filter mode {mode!r}') from exc
-
 DEFAULT_SHAPE_TOL = 1e-2
 DEFAULT_COLOR_TOL = 5e-3
 
@@ -104,7 +64,9 @@ def eq(ar0, ar1, eta=None):
         return np.all(np.abs(ar0 - ar1) < eta)
 
 
-def color_eq(col0, col1, eta=DEFAULT_COLOR_TOL):
+def color_eq(col0, col1, eta=None):
+    if eta is None:
+        eta = DEFAULT_COLOR_TOL
     col0 = np.array(col0, dtype=float)
     col1 = np.array(col1, dtype=float)
 
@@ -141,7 +103,7 @@ def _expand_parameter(value, count, name):
     return result
 
 
-def select_paths(target_feature, path_features, modes='s', pos_tol=DEFAULT_SHAPE_TOL, color_tol=DEFAULT_COLOR_TOL):
+def select_paths(target_feature, path_features, modes='s', pos_tol=None, color_tol=None):
     count = len(path_features)
     if isinstance(modes, str):
         mode_list = [modes] * count
@@ -157,8 +119,14 @@ def select_paths(target_feature, path_features, modes='s', pos_tol=DEFAULT_SHAPE
         elif len(mode_list) != count:
             raise ValueError(f'expected {count} modes, got {len(mode_list)}')
 
-    pos_tols = _expand_parameter(pos_tol, count, 'pos_tol')
-    color_tols = _expand_parameter(color_tol, count, 'color_tol')
+    if pos_tol is None:
+        pos_tols = [DEFAULT_SHAPE_TOL] * count
+    else:
+        pos_tols = _expand_parameter(pos_tol, count, 'pos_tol')
+    if color_tol is None:
+        color_tols = [DEFAULT_COLOR_TOL] * count
+    else:
+        color_tols = _expand_parameter(color_tol, count, 'color_tol')
 
     idx = []
     for i, (path_feature, mode, eta_pos, eta_color) in enumerate(zip(path_features, mode_list, pos_tols, color_tols)):
