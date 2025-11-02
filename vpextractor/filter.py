@@ -58,31 +58,17 @@ def eq(ar0, ar1, eta=1e-2):
     else:
         return np.all(np.abs(ar0 - ar1) < eta)
 
-
-def color_eq(col0, col1, eta=5e-3):
-    col0 = np.array(col0, dtype=float)
-    col1 = np.array(col1, dtype=float)
-
-    if col0.shape != col1.shape:
-        return False
-
-    if not (np.all(np.isfinite(col0)) and np.all(np.isfinite(col1))):
-        return np.array_equal(col0, col1)
-
-    return np.all(np.abs(col0 - col1) <= eta)
-
-
 def select_paths(target_feature, path_features, modes='s'):
     if isinstance(modes, (tuple, list)) and len(modes) != len(path_features):
         raise ValueError(f'expected {len(path_features)} or 1 modes, got {len(path_features)}')
     if isinstance(modes, str):
         modes = repeat(modes)
-
+    
     idx = []
     for i, (path_feature, mode) in enumerate(zip(path_features, modes)):
         if mode in 'sl' and not eq(target_feature['rel_pos'], path_feature['rel_pos']):
             continue # not matched
-        elif mode in 'ol' and not (color_eq(target_feature['color'], path_feature['color']) and color_eq(target_feature['fill'], path_feature['fill'])):
+        elif mode in 'ol' and not (np.array_equal(target_feature['color'], path_feature['color']) and np.array_equal(target_feature['fill'], path_feature['fill'])):
             continue # not matched
         idx.append(i)
     return idx
