@@ -275,8 +275,6 @@ class ElementIdentifier(BaseEventHandler):
             extent,
             bbox,
             bool(feature.get('closed', False)),
-            bool(feature.get('has_stroke', False)),
-            bool(feature.get('has_fill', False)),
         )
 
     def _geometry_signature(self, feature):
@@ -349,14 +347,11 @@ class ElementIdentifier(BaseEventHandler):
         return float(np.linalg.norm(effective - background))
 
     def _style_score(self, feature):
-        scores = []
-        if feature.get('has_stroke', False):
-            scores.append(self._color_contrast(feature.get('color')))
-        if feature.get('has_fill', False):
-            scores.append(self._color_contrast(feature.get('fill')))
-        if not scores:
-            return 0.0
-        return max(scores)
+        color_score = self._color_contrast(feature.get('color'))
+        fill_score = self._color_contrast(feature.get('fill'))
+        if color_score >= fill_score - 1e-6:
+            return color_score
+        return fill_score
 
     def _choose_geometry_representative(self, base_indices, path_features):
         best_idx = None
@@ -368,26 +363,6 @@ class ElementIdentifier(BaseEventHandler):
                 best_idx = idx
                 best_score = score
         return best_idx if best_idx is not None else base_indices[0]
-
-    def _should_merge_geometry_group(self, base_indices, path_features):
-        if len(base_indices) <= 1:
-            return False
-
-        has_fill = False
-        has_stroke = False
-        for idx in base_indices:
-            feature = path_features[idx]
-            if not feature.get('closed', False):
-                return False
-            has_fill = has_fill or feature.get('has_fill', False)
-            has_stroke = has_stroke or feature.get('has_stroke', False)
-
-        if not has_fill:
-            return False
-        if not has_stroke:
-            return False
-
-        return True
 
     def _prepare_artists(self, artists, artists_in_plot, path_features):
         signature_map = OrderedDict()
@@ -416,29 +391,22 @@ class ElementIdentifier(BaseEventHandler):
             geometry_groups.setdefault(geometry_signature, []).append(base_idx)
 
         final_indices = []
-        final_lookup = {}
         for group in geometry_groups.values():
-            if len(group) == 1 or not self._should_merge_geometry_group(group, path_features):
-                for idx in group:
-                    final_indices.append(idx)
-                    members = duplicate_lookup.get(idx, {idx})
-                    if not isinstance(members, set):
-                        members = set(members)
-                    final_lookup[idx] = tuple(sorted(members))
-                continue
-
-            representative = self._choose_geometry_representative(group, path_features)
+            if len(group) == 1:
+                representative = group[0]
+            else:
+                representative = self._choose_geometry_representative(group, path_features)
             final_indices.append(representative)
-            members = set()
+            duplicate_lookup.setdefault(representative, set()).add(representative)
             for idx in group:
-                members.update(duplicate_lookup.get(idx, {idx}))
                 if idx == representative:
                     continue
                 preview_artist = artists_in_plot[idx]
                 if getattr(preview_artist, 'axes', None) is not None:
                     preview_artist.remove()
-                duplicate_lookup.pop(idx, None)
-            final_lookup[representative] = tuple(sorted(members))
+                duplicate_lookup.setdefault(representative, set()).update(duplicate_lookup.get(idx, {idx}))
+                if idx in duplicate_lookup and idx != representative:
+                    duplicate_lookup.pop(idx, None)
 
         unique_artists = [artists[i] for i in final_indices]
         unique_features = [path_features[i] for i in final_indices]
@@ -448,6 +416,13 @@ class ElementIdentifier(BaseEventHandler):
             self._tweak_artist_for_preview(preview_artist)
             unique_plot_artists.append(preview_artist)
 
+        normalized_lookup = {}
+        for idx in final_indices:
+            members = duplicate_lookup.get(idx, {idx})
+            if not isinstance(members, set):
+                members = set(members)
+            normalized_lookup[idx] = tuple(sorted(members))
+
         hidden = len(path_features) - len(final_indices)
 
         return {
@@ -455,7 +430,7 @@ class ElementIdentifier(BaseEventHandler):
             'artists_in_plot': unique_plot_artists,
             'path_features': unique_features,
             'base_indices': final_indices,
-            'duplicate_lookup': final_lookup,
+            'duplicate_lookup': normalized_lookup,
             'hidden': hidden,
             'original_count': len(path_features),
         }
@@ -749,7 +724,7 @@ class RectObjectSelector(RectSelector):
         self.mode = None
         self._finish_button = None
 
-        plot_objects(self.objects, ax=self.display_ax, optimize_preview=True)
+        plot_objects(self.objects, ax=self.display_ax)
 
         self._set_mode(mode)
         self._add_finish_button()
