@@ -17,8 +17,19 @@ import matplotlib.pyplot as plt
 import warnings
 from copy import copy, deepcopy
 from itertools import chain
-from .filter import select_paths
+from .filter import select_paths, DEFAULT_TOLERANCE
 from .utils import dedup
+
+MAX_LINEWIDTH = 5.0
+
+
+def _clamp_linewidth(width, limit=MAX_LINEWIDTH):
+    try:
+        value = float(width)
+    except (TypeError, ValueError):
+        return width
+    return min(value, limit)
+
 
 def add(ax, artist):
     # add artist to ax given different types
@@ -99,8 +110,8 @@ def parse_path(path, split_broken=True):
         patch_kwargs.update(dict(
             ec=path['color'], # edgecolor
             alpha=path['stroke_opacity'],
-            lw=path['width'], # linewidth
-            # closed=path['closePath'], 
+            lw=_clamp_linewidth(path['width']), # linewidth
+            # closed=path['closePath'],
             ls=get_ls(path['dashes']), # linestyle
             ))
     if 'f' in path['type']: # fill
@@ -117,12 +128,13 @@ def parse_path(path, split_broken=True):
         if (path['closePath'] or 'f' in path['type']) and len(coords[0]) > 2:  # closed path or fill, and more than 2 pts (if only 2 pts, it is still a line)
             artist = Polygon(np.vstack(coords).T, **patch_kwargs)
         else: # not a closed path, and not fill: seems to be a line
-            patch_kwargs.pop('closed') 
-            patch_kwargs.pop('fill') 
+            patch_kwargs.pop('closed')
+            patch_kwargs.pop('fill')
             if 'fc' in patch_kwargs:
                 patch_kwargs.pop('fc')
-            patch_kwargs['color'] = patch_kwargs.pop('ec') 
-            # patch_kwargs['lw'] = min((2, patch_kwargs['lw']))
+            patch_kwargs['color'] = patch_kwargs.pop('ec')
+            if 'lw' in patch_kwargs and patch_kwargs['lw'] is not None:
+                patch_kwargs['lw'] = _clamp_linewidth(patch_kwargs['lw'])
             x, y = coords
             artist = Line2D(x, y, **patch_kwargs) #, picker=True, pickradius=5
     elif item_type == {'re'}:
@@ -324,6 +336,7 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
             raise ValueError('expected argument "markers" for "mode=typestr"')
         marker_features = [marker['feature'] for marker in markers]
         match_modes = [marker['match_by'] for marker in markers]
+        tolerances = [marker.get('tolerance', DEFAULT_TOLERANCE) for marker in markers]
         objects = {
             'u': [], # undefined
             's': [], # scatter
@@ -344,7 +357,7 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
                 continue
 
             if typ == 's':
-                idx = select_paths(path_feature, marker_features, match_modes)
+                idx = select_paths(path_feature, marker_features, match_modes, tolerance=tolerances)
                 # if len(idx) != 1:
                 #     pass
                 assert len(idx) == 1, idx
@@ -358,7 +371,7 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
                 if artists_type == Line2D:
                     warnings.warn(f'a group of {len(scatter_artists)} line-like objects marked as scatters')
                     lc_kwargs = { # LineCollection kwargs
-                        'linewidths': [l.get_linewidth() for l in scatter_artists],
+                        'linewidths': [_clamp_linewidth(l.get_linewidth()) for l in scatter_artists],
                         'colors': [to_rgba(l.get_color(), l.get_alpha()) for l in scatter_artists],
                         'linestyles': [l.get_linestyle() for l in scatter_artists],
                         }

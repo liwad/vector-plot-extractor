@@ -6,7 +6,9 @@ Created on Thu Jan 18 19:28:30 2024
 """
 
 import numpy as np
-from .filter import select_paths, rect_filter_objects, get_filtered_objects, normalize_rect_mode
+import logging
+from .filter import (select_paths, rect_filter_objects, get_filtered_objects,
+                     normalize_rect_mode, DEFAULT_TOLERANCE, is_background_like)
 from copy import copy, deepcopy
 from .drawing import add, plot_objects, get_color, Line2D
 import matplotlib.pyplot as plt
@@ -189,6 +191,12 @@ class ElementIdentifier(BaseEventHandler):
         self.matches = []
         self.types = np.full((len(artists),), fill_value='u', dtype='S1') # [S]catter, [L]ine, [D]iscard. u means "not marked"
         self.state = 0
+        self.background_color = self._infer_background_color(self.ax['main'])
+        self.tolerance = DEFAULT_TOLERANCE
+        self.fig.subplots_adjust(bottom=0.18)
+        self.tol_ax = self.fig.add_axes([0.15, 0.05, 0.25, 0.06])
+        self.tol_box = TextBox(self.tol_ax, 'Tolerance', initial=self._format_tolerance(self.tolerance))
+        self.tol_box.on_submit(self._update_tolerance)
         self.fig.suptitle('click element to identify')
     
     def onpick(self, event):
@@ -246,9 +254,16 @@ class ElementIdentifier(BaseEventHandler):
                 
             elif self.state == 2 and event.key in 'sol':
                 self.match_mode = event.key
-                self.matched_idxs = select_paths(self.path_feature, self.path_features, modes=self.match_mode)
+                self.matched_idxs = select_paths(
+                    self.path_feature,
+                    self.path_features,
+                    modes=self.match_mode,
+                    tolerance=self.tolerance,
+                    background_color=self.background_color)
                 self.ax['group'].clear()
                 warntxt = ''
+                if not self.matched_idxs and is_background_like(self.path_feature, self.background_color, self.tolerance):
+                    warntxt = '\n(Selected element matches the background and was ignored)'
                 for i, artist in enumerate(self.artists):
                     if i in self.matched_idxs:
                         add(self.ax['group'], copy(artist))
@@ -270,7 +285,8 @@ class ElementIdentifier(BaseEventHandler):
                 if self.type == 's':
                     self.known_markers.append({
                         'match_by': self.match_mode,
-                        'feature': self.path_feature})
+                        'feature': self.path_feature,
+                        'tolerance': self.tolerance})
                 elif self.type == 'd':  
                     pass
                 elif self.type =='l':
@@ -302,8 +318,42 @@ class ElementIdentifier(BaseEventHandler):
                 self.fig.suptitle('click element to identify, or [F]inish')
         else:
             return
-            
+
         self.fig.canvas.draw()
+
+    def _format_tolerance(self, value):
+        return f"{value:g}"
+
+    def _infer_background_color(self, ax):
+        try:
+            facecolor = np.array(ax.get_facecolor(), dtype=float)
+        except Exception:
+            facecolor = None
+        if facecolor is None or facecolor.size == 0:
+            return np.array([1.0, 1.0, 1.0, 1.0])
+        if facecolor.size >= 4 and facecolor[3] == 0:
+            facecolor = facecolor.copy()
+            facecolor[3] = 1.0
+        return facecolor
+
+    def _update_tolerance(self, text):
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            logging.warning('Invalid tolerance input %r; keeping previous value %s', text, self.tolerance)
+            self.tol_box.set_val(self._format_tolerance(self.tolerance))
+            self.fig.canvas.draw_idle()
+            return
+
+        if value <= 0:
+            logging.warning('Tolerance must be positive; keeping previous value %s', self.tolerance)
+            self.tol_box.set_val(self._format_tolerance(self.tolerance))
+            self.fig.canvas.draw_idle()
+            return
+
+        self.tolerance = value
+        self.tol_box.set_val(self._format_tolerance(self.tolerance))
+        self.fig.canvas.draw_idle()
             
     def save(self, basepath, yes=False):
         # save information to file
