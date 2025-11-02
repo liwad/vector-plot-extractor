@@ -21,6 +21,7 @@ from itertools import chain
 from . import __version__
 from matplotlib.collections import LineCollection, PathCollection, PatchCollection
 from matplotlib.patches import Patch
+from matplotlib import colors as mcolors
 
 class ConsistencyError(Exception):
     pass
@@ -208,6 +209,8 @@ class ElementIdentifier(BaseEventHandler):
         self._marker_preview_idx = None
         self._group_preview_idxs = None
 
+        self._background_rgb = self._determine_background_rgb(ax)
+
         prepared = self._prepare_artists(artists, artists_in_plot, path_features)
         self.artists = prepared['artists']
         self.artists_in_plot = prepared['artists_in_plot']
@@ -287,25 +290,68 @@ class ElementIdentifier(BaseEventHandler):
             bool(feature.get('closed', False)),
         )
 
+    def _determine_background_rgb(self, axes):
+        page_rgb = np.ones(3, dtype=float)
+        fig_rgba = self._to_rgba(self.fig.get_facecolor() if getattr(self, 'fig', None) is not None else None)
+        fig_rgb = self._composite_rgb(fig_rgba, page_rgb)
+        main_ax = axes.get('main') if isinstance(axes, dict) else axes
+        axis_face = None
+        if main_ax is not None:
+            axis_face = getattr(main_ax, 'get_facecolor', lambda: None)()
+        axis_rgba = self._to_rgba(axis_face)
+        background_rgb = self._composite_rgb(axis_rgba, fig_rgb)
+        return background_rgb
+
+    def _to_rgba(self, color):
+        if color is None:
+            return None
+        try:
+            rgba = np.asarray(mcolors.to_rgba(color), dtype=float)
+        except (TypeError, ValueError):
+            arr = np.asarray(color, dtype=float).ravel()
+            if arr.size < 3 or not np.all(np.isfinite(arr[:3])):
+                return None
+            rgb = arr[:3]
+            alpha = arr[3] if arr.size > 3 and np.isfinite(arr[3]) else 1.0
+            rgba = np.concatenate([rgb, [alpha]])
+        if rgba.shape != (4,) or not np.all(np.isfinite(rgba)):
+            return None
+        return np.clip(rgba, 0.0, 1.0)
+
+    def _composite_rgb(self, top_rgba, bottom_rgb):
+        base = np.asarray(bottom_rgb, dtype=float) if bottom_rgb is not None else np.ones(3, dtype=float)
+        if top_rgba is None:
+            return base
+        alpha = float(np.clip(top_rgba[3], 0.0, 1.0))
+        top_rgb = top_rgba[:3]
+        return top_rgb * alpha + base * (1.0 - alpha)
+
+    def _effective_color(self, value):
+        rgba = self._to_rgba(value)
+        if rgba is None:
+            return None
+        alpha = float(np.clip(rgba[3], 0.0, 1.0))
+        rgb = rgba[:3]
+        background = self._background_rgb if self._background_rgb is not None else np.ones(3, dtype=float)
+        if alpha >= 1.0 - 1e-6:
+            return rgb
+        return rgb * alpha + background * (1.0 - alpha)
+
     def _color_contrast(self, value):
         if value is None:
             return 0.0
-        arr = np.asarray(value, dtype=float)
-        if arr.size == 0:
+        effective = self._effective_color(value)
+        if effective is None:
             return 0.0
-        arr = arr.ravel()
-        if arr.size < 3 or not np.all(np.isfinite(arr[:3])):
-            return 0.0
-        rgb = arr[:3]
-        alpha = arr[3] if arr.size > 3 and np.isfinite(arr[3]) else 1.0
-        alpha = float(max(alpha, 0.0))
-        contrast = float(np.linalg.norm(rgb - 1.0))
-        return alpha * contrast
+        background = self._background_rgb if self._background_rgb is not None else np.ones(3, dtype=float)
+        return float(np.linalg.norm(effective - background))
 
     def _style_score(self, feature):
         color_score = self._color_contrast(feature.get('color'))
         fill_score = self._color_contrast(feature.get('fill'))
-        return max(color_score, 0.75 * fill_score)
+        if color_score >= fill_score - 1e-6:
+            return color_score
+        return fill_score
 
     def _choose_geometry_representative(self, base_indices, path_features):
         best_idx = None
