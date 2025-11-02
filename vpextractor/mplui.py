@@ -854,9 +854,9 @@ class DataExtractor(BaseEventHandler):
             }
         
         self.axes = {} # data axes information, not real axes for plot
-        self._ca = None # currect data axis number 
+        self._ca = None # currect data axis number
         self._next_axis = None # the next axis to be changed to
-        
+
         self.select_mode = 'touch'
         
         if pdf_path is not None:
@@ -867,8 +867,9 @@ class DataExtractor(BaseEventHandler):
         else:
             raise NotImplementedError('please input pdf_path')
         
-        plot_objects(self.objects, ax=self.ax0)
-        
+        self._display_objects = deepcopy(self.objects)
+        plot_objects(self._display_objects, ax=self.ax0, optimize_preview=True)
+
         self.set_status(-1)
         
     @property
