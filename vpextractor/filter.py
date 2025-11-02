@@ -50,7 +50,52 @@ def normalize_rect_mode(mode):
     except KeyError as exc:
         raise ValueError(f'unknown rect filter mode {mode!r}') from exc
 
-def eq(ar0, ar1, eta=1e-2):
+DEFAULT_SHAPE_TOL = 1e-2
+DEFAULT_COLOR_TOL = 5e-3
+
+_RECT_MODE_ALIASES = {
+    'touch': 'touch',
+    'keep': 'touch',
+    'include': 'touch',
+    'intersect': 'touch',
+    'subtract': 'subtract',
+    'remove': 'subtract',
+    'exclude': 'subtract',
+}
+
+
+def normalize_rect_mode(mode):
+    """Normalize region filtering mode names.
+
+    Parameters
+    ----------
+    mode : str or None
+        User supplied mode name. Accepts a handful of aliases so callers can
+        use descriptive terms without worrying about the canonical value.
+
+    Returns
+    -------
+    str
+        Either ``'touch'`` (keep only objects that overlap with the rectangle)
+        or ``'subtract'`` (remove overlapped objects).
+    """
+
+    if mode is None:
+        key = 'touch'
+    else:
+        try:
+            key = str(mode).lower()
+        except Exception as exc:
+            raise ValueError(f'unknown rect filter mode {mode!r}') from exc
+
+    try:
+        return _RECT_MODE_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(f'unknown rect filter mode {mode!r}') from exc
+
+def eq(ar0, ar1, eta=None):
+    if eta is None:
+        eta = DEFAULT_SHAPE_TOL
     ar0 = np.array(ar0)
     ar1 = np.array(ar1)
     if ar0.shape != ar1.shape:
