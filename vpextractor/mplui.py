@@ -9,14 +9,7 @@ import math
 from collections import OrderedDict
 
 import numpy as np
-from .filter import (
-    select_paths,
-    rect_filter_objects,
-    get_filtered_objects,
-    normalize_rect_mode,
-    DEFAULT_SHAPE_TOL,
-    DEFAULT_COLOR_TOL,
-)
+from .filter import select_paths, rect_filter_objects, get_filtered_objects, normalize_rect_mode
 from copy import copy, deepcopy
 from .drawing import add, plot_objects, get_color, Line2D
 import matplotlib.pyplot as plt
@@ -919,7 +912,7 @@ class RectObjectSelector(RectSelector):
     }
 
     def init(self, objects, ax=None, mode='touch'):
-        super().init(finish=False)
+        super().init()
         if ax is None:
             ax = getattr(self.fig, 'ax', None)
             if ax is None:
@@ -936,24 +929,10 @@ class RectObjectSelector(RectSelector):
 
         self._held_mode = None
         self.mode = None
-        self._finish_button = None
 
-        plot_objects(self.objects, ax=self.display_ax, optimize_preview=True)
+        plot_objects(self.objects, ax=self.display_ax)
 
         self._set_mode(mode)
-        self._add_finish_button()
-
-    def _add_finish_button(self):
-        bbox = self.display_ax.get_position()
-        width = 0.12
-        height = 0.05
-        margin = 0.02
-        x = max(margin, min(bbox.x1 - width, 1 - width - margin))
-        y = max(margin, bbox.y0 - height - margin)
-        self._finish_button_ax = self.fig.add_axes([x, y, width, height])
-        self._finish_button = Button(self._finish_button_ax, 'Done')
-        self._finish_button.on_clicked(self._finish_selection)
-        self._finish_button_ax._selector_ignore = True  # prevent picking up drag events
 
     def _set_mode(self, mode, *, force=False):
         normalized = normalize_rect_mode(mode)
@@ -972,7 +951,6 @@ class RectObjectSelector(RectSelector):
             hint = 'Press [M] to remove, hold Alt to temporarily remove, [R] to reset.'
         else:
             hint = 'Press [M] to keep instead, [R] to reset.'
-        hint += ' Click Done or press Enter when finished.'
         self.display_ax.set_title(f"Mode: {style['title']}. {hint}")
         self.fig.canvas.draw_idle()
 
@@ -982,9 +960,6 @@ class RectObjectSelector(RectSelector):
 
     def onrelease(self, event):
         super().onrelease(event)
-
-        if self.ax is None:
-            return
 
         touched = rect_filter_objects(self.objects, self.x0, self.x1, self.y0, self.y1, mode=self.mode)
         self.last_selected = touched
@@ -1020,9 +995,7 @@ class RectObjectSelector(RectSelector):
         elif event.key == 'alt' and self._held_mode is not None:
             self._set_mode(self._held_mode)
             self._held_mode = None
-        elif event.key in ('enter', 'return'):
-            self._finish_selection()
-
+            
     def get_filtered_objects(self):
         # print(self.selected)
         return get_filtered_objects(self.orig_objects, self.selected)
