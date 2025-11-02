@@ -5,6 +5,9 @@ Created on Thu Jan 18 19:28:30 2024
 @author: Yu-Chen Wang
 """
 
+import math
+from collections import OrderedDict
+
 import numpy as np
 from .filter import select_paths, rect_filter_objects, get_filtered_objects, normalize_rect_mode
 from copy import copy, deepcopy
@@ -16,6 +19,8 @@ import json
 from matplotlib.widgets import TextBox, Button
 from itertools import chain
 from . import __version__
+from matplotlib.collections import LineCollection, PathCollection, PatchCollection
+from matplotlib.patches import Patch
 
 class ConsistencyError(Exception):
     pass
@@ -197,15 +202,25 @@ class ObjectChecker(BaseEventHandler):
 class ElementIdentifier(BaseEventHandler):
     def init(self, ax, artists, artists_in_plot, path_features):
         self.ax = ax
-        self.artists = artists
-        self.artists_in_plot = artists_in_plot
-        self.path_features = path_features
-        self.indexes = np.arange(len(self.path_features), dtype=int)
         self.known_markers = []
         self.matches = []
-        self.types = np.full((len(artists),), fill_value='u', dtype='S1') # [S]catter, [L]ine, [D]iscard. u means "not marked"
         self.state = 0
-        self.fig.suptitle('click element to identify')
+        self._marker_preview_idx = None
+        self._group_preview_idxs = None
+
+        prepared = self._prepare_artists(artists, artists_in_plot, path_features)
+        self.artists = prepared['artists']
+        self.artists_in_plot = prepared['artists_in_plot']
+        self.path_features = prepared['path_features']
+        self.indexes = np.array(prepared['base_indices'], dtype=int)
+        self._duplicate_lookup = prepared['duplicate_lookup']
+        self._hidden_duplicates = prepared['hidden']
+        self.types = np.full((prepared['original_count'],), fill_value='u', dtype='S1') # [S]catter, [L]ine, [D]iscard. u means "not marked"
+
+        self._idle_title = self._compose_idle_title()
+        self.fig.suptitle(self._idle_title)
+
+        self.cids.append(self.fig.canvas.mpl_connect('resize_event', self._on_resize))
     
     def onpick(self, event):
         artist = event.artist
@@ -216,12 +231,9 @@ class ElementIdentifier(BaseEventHandler):
             self.path_feature = self.path_features[idx]
             # print(idx, self.path_feature)
             self.fig.suptitle('object type: [S]catter, [L]ine, [D]iscard, [O]thers, or [C]ancel')
-            self.ax['marker'].clear()
-            add(self.ax['marker'], copy(self.artists[idx]))
-            self.ax['marker'].autoscale(True)
-            self.ax['marker'].invert_yaxis()
+            self._draw_marker_preview(idx)
             self.state = 1
-            
+
             self.fig.canvas.draw()
         
     # match_mode_dict = { # keyboard shortcut: mode code in code
@@ -236,6 +248,210 @@ class ElementIdentifier(BaseEventHandler):
         'd': 'discard',
         'o': 'others',
         }
+
+    def _compose_idle_title(self):
+        base = 'click element to identify'
+        if self._hidden_duplicates:
+            dup = self._hidden_duplicates
+            plural = 's' if dup != 1 else ''
+            base += f' ({dup} duplicate{plural} hidden)'
+        return base + ', or [F]inish'
+
+    def _feature_signature(self, feature):
+        rel_pos = np.asarray(feature['rel_pos'], dtype=np.float64)
+        color = np.asarray(feature['color'], dtype=np.float64)
+        fill = np.asarray(feature['fill'], dtype=np.float64)
+        extent = tuple(np.round(np.asarray(feature.get('extent', (0.0, 0.0)), dtype=np.float64), 6))
+        bbox = tuple(np.round(np.asarray(feature.get('bbox', (0.0, 0.0, 0.0, 0.0)), dtype=np.float64), 6))
+        return (
+            feature.get('type'),
+            rel_pos.tobytes(),
+            color.tobytes(),
+            fill.tobytes(),
+            feature.get('artist_class'),
+            extent,
+            bbox,
+            bool(feature.get('closed', False)),
+        )
+
+    def _prepare_artists(self, artists, artists_in_plot, path_features):
+        signature_map = OrderedDict()
+        for idx, feature in enumerate(path_features):
+            signature = self._feature_signature(feature)
+            signature_map.setdefault(signature, []).append(idx)
+
+        base_indices = []
+        duplicate_lookup = {}
+        hidden = 0
+        for group in signature_map.values():
+            base_idx = group[0]
+            base_indices.append(base_idx)
+            duplicate_lookup[base_idx] = tuple(group)
+            hidden += len(group) - 1
+            for dup_idx in group[1:]:
+                artists_in_plot[dup_idx].remove()
+
+        unique_artists = [artists[i] for i in base_indices]
+        unique_features = [path_features[i] for i in base_indices]
+        unique_plot_artists = []
+        for i in base_indices:
+            preview_artist = artists_in_plot[i]
+            self._tweak_artist_for_preview(preview_artist)
+            unique_plot_artists.append(preview_artist)
+
+        return {
+            'artists': unique_artists,
+            'artists_in_plot': unique_plot_artists,
+            'path_features': unique_features,
+            'base_indices': base_indices,
+            'duplicate_lookup': duplicate_lookup,
+            'hidden': hidden,
+            'original_count': len(path_features),
+        }
+
+    def _on_resize(self, _event):
+        if self._marker_preview_idx is not None:
+            if self._marker_preview_idx < len(self.artists):
+                self._draw_marker_preview(self._marker_preview_idx, redraw_only=True)
+            else:
+                self._marker_preview_idx = None
+                self.ax['marker'].clear()
+
+        if self._group_preview_idxs:
+            valid = [idx for idx in self._group_preview_idxs if idx < len(self.artists)]
+            if valid:
+                self._group_preview_idxs = valid
+                self._draw_group_preview(valid, redraw_only=True)
+            else:
+                self._group_preview_idxs = None
+                self.ax['group'].clear()
+                self.ax['group'].set_title('')
+                self.fig.canvas.draw_idle()
+
+    def _make_preview_artist(self, artist, axis):
+        preview = copy(artist)
+        preview.set_transform(axis.transData)
+        self._tweak_artist_for_preview(preview)
+        return preview
+
+    def _tweak_artist_for_preview(self, artist):
+        lw_min, lw_max = 0.3, 2.5
+        try:
+            if isinstance(artist, Line2D):
+                lw = artist.get_linewidth()
+                if np.isfinite(lw):
+                    artist.set_linewidth(min(max(lw, lw_min), lw_max))
+                ms = artist.get_markersize()
+                if np.isfinite(ms):
+                    artist.set_markersize(min(ms, 12))
+            elif isinstance(artist, LineCollection):
+                lws = artist.get_linewidths()
+                if lws is not None and len(lws):
+                    artist.set_linewidths(np.clip(lws, lw_min, lw_max))
+            elif isinstance(artist, (PatchCollection, PathCollection)):
+                lws = artist.get_linewidths()
+                if lws is not None and len(lws):
+                    artist.set_linewidths(np.clip(lws, lw_min, lw_max))
+            elif isinstance(artist, Patch):
+                lw = artist.get_linewidth()
+                if lw is not None and np.isfinite(lw):
+                    artist.set_linewidth(min(max(lw, lw_min), lw_max))
+        except Exception:
+            pass
+
+    def _draw_marker_preview(self, idx, redraw_only=False):
+        if not redraw_only:
+            self._marker_preview_idx = idx
+        ax = self.ax['marker']
+        ax.clear()
+        if idx is None or idx >= len(self.artists):
+            self.fig.canvas.draw_idle()
+            return
+        preview = self._make_preview_artist(self.artists[idx], ax)
+        add(ax, preview)
+        ax.autoscale(True)
+        ax.invert_yaxis()
+        self.fig.canvas.draw_idle()
+
+    def _draw_group_preview(self, indices, redraw_only=False):
+        if not redraw_only:
+            self._group_preview_idxs = list(indices)
+        elif self._group_preview_idxs is not None:
+            indices = self._group_preview_idxs
+        ax = self.ax['group']
+        ax.clear()
+        if not indices:
+            ax.set_title('')
+            self.fig.canvas.draw_idle()
+            return
+        count = 0
+        for idx in indices:
+            if idx is None or idx >= len(self.artists):
+                continue
+            preview = self._make_preview_artist(self.artists[idx], ax)
+            add(ax, preview)
+            count += 1
+        ax.autoscale(True)
+        ax.invert_yaxis()
+        ax.set_title(f'found {count}')
+        self.fig.canvas.draw_idle()
+
+    def _safe_extent_ratio(self, extent):
+        width, height = extent
+        eps = 1e-6
+        if width < eps or height < eps:
+            return None
+        return width / height
+
+    def _extent_compatible(self, base_extent, candidate_extent):
+        base_extent = np.asarray(base_extent, dtype=float)
+        candidate_extent = np.asarray(candidate_extent, dtype=float)
+        if base_extent.shape != (2,) or candidate_extent.shape != (2,):
+            return True
+        eps = 1e-6
+        base_diag = math.hypot(base_extent[0], base_extent[1])
+        cand_diag = math.hypot(candidate_extent[0], candidate_extent[1])
+        if base_diag < eps:
+            return cand_diag < 3 * eps
+        ratio = cand_diag / base_diag if base_diag else np.inf
+        if ratio < 0.5 or ratio > 2.0:
+            return False
+        base_ratio = self._safe_extent_ratio(base_extent)
+        cand_ratio = self._safe_extent_ratio(candidate_extent)
+        if base_ratio is None or cand_ratio is None:
+            return True
+        rel = cand_ratio / base_ratio if base_ratio else np.inf
+        return 0.5 <= rel <= 2.0
+
+    def _filter_matches(self, matched_idxs):
+        if self.type != 's':
+            return matched_idxs
+        base_extent = self.path_feature.get('extent')
+        base_artist_class = self.path_feature.get('artist_class')
+        filtered = []
+        for idx in matched_idxs:
+            feature = self.path_features[idx]
+            if base_artist_class and feature.get('artist_class') != base_artist_class:
+                continue
+            if base_extent is not None and feature.get('extent') is not None:
+                if not self._extent_compatible(base_extent, feature.get('extent')):
+                    continue
+            filtered.append(idx)
+        return filtered
+
+    def _find_line_like_match(self, indices):
+        for idx in indices:
+            artist = self.artists[idx]
+            if isinstance(artist, Line2D) and (artist.get_marker() in (None, '', ' ')):
+                return artist
+        return None
+
+    def _expand_duplicate_indices(self, base_indices):
+        expanded = []
+        for base_idx in np.atleast_1d(base_indices):
+            base_idx = int(base_idx)
+            expanded.extend(self._duplicate_lookup.get(base_idx, (base_idx,)))
+        return np.array(expanded, dtype=int)
         
     def onkeyrelease(self, event):
         if self.state == 0: #
@@ -248,41 +464,35 @@ class ElementIdentifier(BaseEventHandler):
                 self.finished = True
             else:
                 self.state = 0
-                self.fig.suptitle('click element to identify, or [F]inish')
+                self.fig.suptitle(self._idle_title)
         elif self.state >= 1 and self.state <= 9: # currently handling an object
             if event.key == 'c': # cancelled
                 self.state = 0
-                self.fig.suptitle('click element to identify, or [F]inish')
-                
+                self.fig.suptitle(self._idle_title)
+
             elif self.state == 1 and event.key in 'sldo': # have just chosen object type
                 self.type = event.key
                 # next step, choose how to match similar objects
                 self.fig.suptitle('chosen "{}". match [S]hape, c[O]lor, co[L]or+shape, or [C]ancel'.format(self.__class__.type_names[self.type]))
                 self.state = 2
-                
+
             elif self.state == 2 and event.key in 'sol':
                 self.match_mode = event.key
                 self.matched_idxs = select_paths(self.path_feature, self.path_features, modes=self.match_mode)
-                self.ax['group'].clear()
+                self.matched_idxs = self._filter_matches(self.matched_idxs)
                 warntxt = ''
-                for i, artist in enumerate(self.artists):
-                    if i in self.matched_idxs:
-                        add(self.ax['group'], copy(artist))
-                        # print(artist, isinstance(artist, Line2D))
-                        if self.type == 's' and not warntxt and isinstance(artist, Line2D):
-                            # print('here')
-                            warntxt = '\n(WARNING: elements labelled as "scatter", but at least one is line-like)'
-                self.ax['group'].set_title(f'found {len(self.matched_idxs)}')
-                self.ax['group'].autoscale(True)
-                self.ax['group'].invert_yaxis()
-                # self.ax['group'].set_xlim(self.ax['main'].get_xlim())
-                # self.ax['group'].set_ylim(self.ax['main'].get_ylim())
+                if self.type == 's':
+                    warn_artist = self._find_line_like_match(self.matched_idxs)
+                    if warn_artist is not None:
+                        warntxt = '\n(WARNING: elements labelled as "scatter", but at least one is line-like)'
+                self._draw_group_preview(self.matched_idxs)
                 self.fig.suptitle(f'press any key to continue or [C]ancel{warntxt}')
                 self.state = 3
-                    
+
             elif self.state == 3:
-                self.types[self.indexes[self.matched_idxs]] = self.type
-                    
+                target_indices = self._expand_duplicate_indices(self.indexes[self.matched_idxs])
+                self.types[target_indices] = self.type
+
                 if self.type == 's':
                     self.known_markers.append({
                         'match_by': self.match_mode,
@@ -304,6 +514,8 @@ class ElementIdentifier(BaseEventHandler):
                 for i, artist in enumerate(self.artists):
                     if i in self.matched_idxs:
                         self.artists_in_plot[i].remove()
+                        base_idx = self.indexes[i]
+                        self._duplicate_lookup.pop(base_idx, None)
                     else:
                         new_artists.append(artist)
                         new_artists_in_plot.append(self.artists_in_plot[i])
@@ -313,9 +525,15 @@ class ElementIdentifier(BaseEventHandler):
                 self.artists_in_plot = new_artists_in_plot
                 self.path_features = new_path_features
                 self.indexes = np.array(new_indexes)
-                
+                self._marker_preview_idx = None
+                self._group_preview_idxs = None
+                self.ax['marker'].clear()
+                self.ax['group'].clear()
+                self.ax['group'].set_title('')
+                self.fig.canvas.draw_idle()
+
                 self.state = 0
-                self.fig.suptitle('click element to identify, or [F]inish')
+                self.fig.suptitle(self._idle_title)
         else:
             return
             
