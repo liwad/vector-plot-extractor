@@ -201,6 +201,10 @@ class ObjectChecker(BaseEventHandler):
         print(f'path_feature = {self.path_feature}')
 
 class ElementIdentifier(BaseEventHandler):
+    _REL_POS_DECIMALS = 4
+    _COLOR_DECIMALS = 4
+    _EXTENT_DECIMALS = 6
+
     def init(self, ax, artists, artists_in_plot, path_features):
         self.ax = ax
         self.known_markers = []
