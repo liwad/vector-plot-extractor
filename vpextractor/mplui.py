@@ -5,6 +5,9 @@ Created on Thu Jan 18 19:28:30 2024
 @author: Yu-Chen Wang
 """
 
+import math
+from collections import OrderedDict
+
 import numpy as np
 from .filter import select_paths, rect_filter_objects, get_filtered_objects, normalize_rect_mode
 from copy import copy, deepcopy
@@ -13,9 +16,12 @@ import matplotlib.pyplot as plt
 from .utils import pause_and_warn, save_pickle, annotate, dedup
 import os
 import json
-from matplotlib.widgets import TextBox
+from matplotlib.widgets import TextBox, Button
 from itertools import chain
 from . import __version__
+from matplotlib.collections import LineCollection, PathCollection, PatchCollection
+from matplotlib.patches import Patch
+from matplotlib import colors as mcolors
 
 class ConsistencyError(Exception):
     pass
@@ -128,28 +134,44 @@ class RectSelector(BaseEventHandler):
             rect, = ax.plot([], [], linestyle='--', color='r')
             self.rects[ax] = rect
         self.finish = finish
-    
+
     def onpress(self, event):
+        if event.inaxes not in self.rects:
+            self.ax = None
+            return
+
+        if event.xdata is None or event.ydata is None:
+            self.ax = None
+            return
+
         self.finished = False
         self.ax = event.inaxes
         self.x0, self.y0 = event.xdata, event.ydata
-    
+
     def onmove_down(self, event):
         if event.inaxes == self.ax:
             self.x1, self.y1 = event.xdata, event.ydata
-            
+
             x, y  = self.get_xydata()
             self.rects[self.ax].set_data(x, y)
             self.rects[self.ax].set_marker('')
             self.fig.canvas.draw()
             
     def onrelease(self, event):
-        self.x0, self.x1 = np.sort((self.x0, self.x1))
-        self.y0, self.y1 = np.sort((self.y0, self.y1))
+        if self.ax is None or self.ax not in self.rects:
+            return
+
+        x1 = getattr(self, 'x1', self.x0)
+        y1 = getattr(self, 'y1', self.y0)
+
+        self.x0, x1 = np.sort((self.x0, x1))
+        self.y0, y1 = np.sort((self.y0, y1))
+        self.x1, self.y1 = x1, y1
+
         self.rects[self.ax].set_marker('s')
         self.fig.canvas.draw()
-        
-        if self.finish: 
+
+        if self.finish:
             self.finished = True
         
     def get_xydata(self, closed=True):
@@ -179,17 +201,51 @@ class ObjectChecker(BaseEventHandler):
         print(f'path_feature = {self.path_feature}')
 
 class ElementIdentifier(BaseEventHandler):
+    _EXTENT_DECIMALS = 6
+    _AUTO_DISCARD_CONTRAST = 0.05
+    _MIN_SHAPE_TOL = 1e-5
+    _MIN_COLOR_TOL = 1e-5
+
     def init(self, ax, artists, artists_in_plot, path_features):
         self.ax = ax
-        self.artists = artists
-        self.artists_in_plot = artists_in_plot
-        self.path_features = path_features
-        self.indexes = np.arange(len(self.path_features), dtype=int)
         self.known_markers = []
         self.matches = []
-        self.types = np.full((len(artists),), fill_value='u', dtype='S1') # [S]catter, [L]ine, [D]iscard. u means "not marked"
         self.state = 0
-        self.fig.suptitle('click element to identify')
+        self._marker_preview_idx = None
+        self._group_preview_idxs = None
+        self.matched_idxs = []
+        self.shape_tol = DEFAULT_SHAPE_TOL
+        self.color_tol = DEFAULT_COLOR_TOL
+        self._tol_update_guard = False
+        self._shape_tol_box = None
+        self._color_tol_box = None
+        self._auto_discard_members = ()
+        self._auto_discard_count = 0
+        self._hidden_duplicates = 0
+
+        self._background_rgb = self._determine_background_rgb(ax)
+        self._background_contrast_threshold = self._AUTO_DISCARD_CONTRAST
+
+        prepared = self._prepare_artists(artists, artists_in_plot, path_features)
+        self.artists = prepared['artists']
+        self.artists_in_plot = prepared['artists_in_plot']
+        self.path_features = prepared['path_features']
+        self.indexes = np.array(prepared['base_indices'], dtype=int)
+        self._duplicate_lookup = prepared['duplicate_lookup']
+        self._hidden_duplicates = prepared['hidden_duplicates']
+        self._auto_discard_members = tuple(prepared.get('auto_discard', ()))
+        self._auto_discard_count = sum(len(group) for group in self._auto_discard_members)
+        self.types = np.full((prepared['original_count'],), fill_value='u', dtype='S1') # [S]catter, [L]ine, [D]iscard. u means "not marked"
+        if self._auto_discard_members:
+            for group in self._auto_discard_members:
+                self.types[np.array(group, dtype=int)] = b'd'
+
+        self._setup_tolerance_controls()
+
+        self._idle_title = self._compose_idle_title()
+        self.fig.suptitle(self._idle_title)
+
+        self.cids.append(self.fig.canvas.mpl_connect('resize_event', self._on_resize))
     
     def onpick(self, event):
         artist = event.artist
@@ -199,13 +255,10 @@ class ElementIdentifier(BaseEventHandler):
             idx = self.artists_in_plot.index(artist)
             self.path_feature = self.path_features[idx]
             # print(idx, self.path_feature)
-            self.fig.suptitle('object type: [S]catter, [L]ine, [D]iscard, [O]thers, or [C]ancel')
-            self.ax['marker'].clear()
-            add(self.ax['marker'], copy(self.artists[idx]))
-            self.ax['marker'].autoscale(True)
-            self.ax['marker'].invert_yaxis()
+            self.fig.suptitle('object type: [S]catter, [L]ine, [D]iscard, [O]thers, [Del] remove, or [C]ancel')
+            self._draw_marker_preview(idx)
             self.state = 1
-            
+
             self.fig.canvas.draw()
         
     # match_mode_dict = { # keyboard shortcut: mode code in code
@@ -220,6 +273,545 @@ class ElementIdentifier(BaseEventHandler):
         'd': 'discard',
         'o': 'others',
         }
+
+    def _compose_idle_title(self):
+        base = 'click element to identify'
+        if self._hidden_duplicates:
+            dup = self._hidden_duplicates
+            plural = 's' if dup != 1 else ''
+            base += f' ({dup} duplicate{plural} hidden)'
+        if self._auto_discard_count:
+            auto = self._auto_discard_count
+            plural = 's' if auto != 1 else ''
+            base += f' ({auto} low-contrast auto-discard{plural})'
+        return base + ', or [F]inish'
+
+    def _format_tol(self, value):
+        return f'{float(value):.4g}'
+
+    def _parse_tol_input(self, text, current, minimum):
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return current, False
+        if not np.isfinite(value) or value <= 0:
+            return current, False
+        value = max(value, minimum)
+        if math.isclose(value, current, rel_tol=1e-9, abs_tol=1e-12):
+            return current, False
+        return value, True
+
+    def _update_textbox(self, box, value):
+        if box is None:
+            return
+        if self._tol_update_guard:
+            return
+        self._tol_update_guard = True
+        try:
+            box.set_val(self._format_tol(value))
+        finally:
+            self._tol_update_guard = False
+
+    def _setup_tolerance_controls(self):
+        if not hasattr(self, 'fig'):
+            return
+
+        group_ax = self.ax.get('group') if isinstance(self.ax, dict) else None
+        bbox = group_ax.get_position() if group_ax is not None else self.fig.axes[-1].get_position()
+        width = min(0.22, max(0.12, bbox.width))
+        height = 0.05
+        pad = 0.01
+        y_color = bbox.y0 - height - pad
+        y_shape = y_color - height - pad
+        if y_shape < 0.02:
+            y_shape = min(0.9 - height, bbox.y1 + pad)
+            y_color = y_shape + height + pad
+            if y_color + height > 0.95:
+                y_color = max(0.02, y_shape - height - pad)
+        y_shape = min(max(y_shape, 0.02), 0.95 - height)
+        y_color = min(max(y_color, 0.02), 0.95 - height)
+        x = min(max(bbox.x0, 0.02), 1 - width - pad)
+
+        shape_ax = self.fig.add_axes([x, y_shape, width, height])
+        color_ax = self.fig.add_axes([x, y_color, width, height])
+        shape_ax._selector_ignore = True
+        color_ax._selector_ignore = True
+
+        self._shape_tol_box = TextBox(shape_ax, 'shape tol', initial=self._format_tol(self.shape_tol))
+        self._color_tol_box = TextBox(color_ax, 'color tol', initial=self._format_tol(self.color_tol))
+        self._shape_tol_box.on_submit(self._on_shape_tol_submit)
+        self._color_tol_box.on_submit(self._on_color_tol_submit)
+
+    def _on_shape_tol_submit(self, text):
+        if self._tol_update_guard:
+            return
+        new_value, changed = self._parse_tol_input(text, self.shape_tol, self._MIN_SHAPE_TOL)
+        self.shape_tol = new_value
+        self._update_textbox(self._shape_tol_box, self.shape_tol)
+        if changed and self.state == 0:
+            self.fig.suptitle(self._idle_title)
+        self.fig.canvas.draw_idle()
+
+    def _on_color_tol_submit(self, text):
+        if self._tol_update_guard:
+            return
+        new_value, changed = self._parse_tol_input(text, self.color_tol, self._MIN_COLOR_TOL)
+        self.color_tol = new_value
+        self._update_textbox(self._color_tol_box, self.color_tol)
+        if changed and self.state == 0:
+            self.fig.suptitle(self._idle_title)
+        self.fig.canvas.draw_idle()
+
+    def _quantize_rel_pos(self, rel_pos):
+        arr = np.array(rel_pos, dtype=np.float64, copy=True)
+        if arr.size == 0:
+            return arr
+        finite = np.isfinite(arr)
+        if finite.any():
+            tol = max(float(self.shape_tol), self._MIN_SHAPE_TOL)
+            arr[finite] = np.round(arr[finite] / tol) * tol
+        return arr
+
+    def _quantize_color(self, color):
+        arr = np.array(color, dtype=np.float64, copy=True)
+        if arr.size == 0:
+            return arr
+        finite = np.isfinite(arr)
+        if finite.any():
+            tol = max(float(self.color_tol), self._MIN_COLOR_TOL)
+            arr[finite] = np.round(arr[finite] / tol) * tol
+        return arr
+
+    def _round_tuple(self, values, decimals):
+        arr = np.array(values, dtype=np.float64, copy=True)
+        if arr.size:
+            finite = np.isfinite(arr)
+            if finite.any():
+                arr[finite] = np.round(arr[finite], decimals)
+        return tuple(arr.tolist())
+
+    def _feature_signature(self, feature):
+        rel_pos = self._quantize_rel_pos(feature['rel_pos'])
+        color = self._quantize_color(feature['color'])
+        fill = self._quantize_color(feature['fill'])
+        extent = self._round_tuple(feature.get('extent', (0.0, 0.0)), self._EXTENT_DECIMALS)
+        bbox = self._round_tuple(feature.get('bbox', (0.0, 0.0, 0.0, 0.0)), self._EXTENT_DECIMALS)
+        return (
+            feature.get('type'),
+            rel_pos.tobytes(),
+            color.tobytes(),
+            fill.tobytes(),
+            feature.get('artist_class'),
+            extent,
+            bbox,
+            bool(feature.get('closed', False)),
+            bool(feature.get('has_stroke', False)),
+            bool(feature.get('has_fill', False)),
+        )
+
+    def _geometry_signature(self, feature):
+        rel_pos = self._quantize_rel_pos(feature['rel_pos'])
+        extent = self._round_tuple(feature.get('extent', (0.0, 0.0)), self._EXTENT_DECIMALS)
+        bbox = self._round_tuple(feature.get('bbox', (0.0, 0.0, 0.0, 0.0)), self._EXTENT_DECIMALS)
+        return (
+            feature.get('type'),
+            rel_pos.tobytes(),
+            feature.get('artist_class'),
+            extent,
+            bbox,
+            bool(feature.get('closed', False)),
+        )
+
+    def _determine_background_rgb(self, axes):
+        page_rgb = np.ones(3, dtype=float)
+        fig_rgba = self._to_rgba(self.fig.get_facecolor() if getattr(self, 'fig', None) is not None else None)
+        fig_rgb = self._composite_rgb(fig_rgba, page_rgb)
+        main_ax = axes.get('main') if isinstance(axes, dict) else axes
+        axis_face = None
+        if main_ax is not None:
+            axis_face = getattr(main_ax, 'get_facecolor', lambda: None)()
+        axis_rgba = self._to_rgba(axis_face)
+        background_rgb = self._composite_rgb(axis_rgba, fig_rgb)
+        return background_rgb
+
+    def _to_rgba(self, color):
+        if color is None:
+            return None
+        try:
+            rgba = np.asarray(mcolors.to_rgba(color), dtype=float)
+        except (TypeError, ValueError):
+            arr = np.asarray(color, dtype=float).ravel()
+            if arr.size < 3 or not np.all(np.isfinite(arr[:3])):
+                return None
+            rgb = arr[:3]
+            alpha = arr[3] if arr.size > 3 and np.isfinite(arr[3]) else 1.0
+            rgba = np.concatenate([rgb, [alpha]])
+        if rgba.shape != (4,) or not np.all(np.isfinite(rgba)):
+            return None
+        return np.clip(rgba, 0.0, 1.0)
+
+    def _composite_rgb(self, top_rgba, bottom_rgb):
+        base = np.asarray(bottom_rgb, dtype=float) if bottom_rgb is not None else np.ones(3, dtype=float)
+        if top_rgba is None:
+            return base
+        alpha = float(np.clip(top_rgba[3], 0.0, 1.0))
+        top_rgb = top_rgba[:3]
+        return top_rgb * alpha + base * (1.0 - alpha)
+
+    def _effective_color(self, value):
+        rgba = self._to_rgba(value)
+        if rgba is None:
+            return None
+        alpha = float(np.clip(rgba[3], 0.0, 1.0))
+        rgb = rgba[:3]
+        background = self._background_rgb if self._background_rgb is not None else np.ones(3, dtype=float)
+        if alpha >= 1.0 - 1e-6:
+            return rgb
+        return rgb * alpha + background * (1.0 - alpha)
+
+    def _color_contrast(self, value):
+        if value is None:
+            return 0.0
+        effective = self._effective_color(value)
+        if effective is None:
+            return 0.0
+        background = self._background_rgb if self._background_rgb is not None else np.ones(3, dtype=float)
+        return float(np.linalg.norm(effective - background))
+
+    def _style_score(self, feature):
+        scores = []
+        if feature.get('has_stroke', False):
+            scores.append(self._color_contrast(feature.get('color')))
+        if feature.get('has_fill', False):
+            scores.append(self._color_contrast(feature.get('fill')))
+        if not scores:
+            return 0.0
+        return max(scores)
+
+    def _choose_geometry_representative(self, base_indices, path_features):
+        best_idx = None
+        best_score = -np.inf
+        for idx in base_indices:
+            feature = path_features[idx]
+            score = self._style_score(feature)
+            if best_idx is None or score > best_score + 1e-12:
+                best_idx = idx
+                best_score = score
+        return best_idx if best_idx is not None else base_indices[0]
+
+    def _should_merge_geometry_group(self, base_indices, path_features):
+        if len(base_indices) <= 1:
+            return False
+
+        has_fill = False
+        has_stroke = False
+        for idx in base_indices:
+            feature = path_features[idx]
+            if not feature.get('closed', False):
+                return False
+            has_fill = has_fill or feature.get('has_fill', False)
+            has_stroke = has_stroke or feature.get('has_stroke', False)
+
+        if not has_fill:
+            return False
+        if not has_stroke:
+            return False
+
+        return True
+
+    def _prepare_artists(self, artists, artists_in_plot, path_features):
+        signature_map = OrderedDict()
+        for idx, feature in enumerate(path_features):
+            signature = self._feature_signature(feature)
+            signature_map.setdefault(signature, []).append(idx)
+
+        base_indices = []
+        duplicate_lookup = {}
+
+        for group in signature_map.values():
+            base_idx = group[0]
+            base_indices.append(base_idx)
+            dupset = duplicate_lookup.setdefault(base_idx, set())
+            for dup_idx in group:
+                dupset.add(dup_idx)
+            for dup_idx in group[1:]:
+                preview_artist = artists_in_plot[dup_idx]
+                if getattr(preview_artist, 'axes', None) is not None:
+                    preview_artist.remove()
+
+        geometry_groups = OrderedDict()
+        for base_idx in base_indices:
+            feature = path_features[base_idx]
+            geometry_signature = self._geometry_signature(feature)
+            geometry_groups.setdefault(geometry_signature, []).append(base_idx)
+
+        final_indices = []
+        for group in geometry_groups.values():
+            if len(group) == 1 or not self._should_merge_geometry_group(group, path_features):
+                for idx in group:
+                    final_indices.append(idx)
+                continue
+
+            representative = self._choose_geometry_representative(group, path_features)
+            final_indices.append(representative)
+            members = set()
+            for idx in group:
+                members.update(duplicate_lookup.get(idx, {idx}))
+                if idx == representative:
+                    continue
+                preview_artist = artists_in_plot[idx]
+                if getattr(preview_artist, 'axes', None) is not None:
+                    preview_artist.remove()
+                duplicate_lookup.pop(idx, None)
+            duplicate_lookup[representative] = members
+
+        hidden_duplicates = len(path_features) - len(final_indices)
+
+        visible_indices = []
+        visible_lookup = {}
+        visible_artists = []
+        visible_features = []
+        visible_plot_artists = []
+        auto_discard = []
+
+        for idx in final_indices:
+            members = duplicate_lookup.get(idx, {idx})
+            if not isinstance(members, set):
+                members = set(members)
+            member_tuple = tuple(sorted(members))
+            feature = path_features[idx]
+            score = self._style_score(feature)
+            if score < self._background_contrast_threshold:
+                preview_artist = artists_in_plot[idx]
+                if getattr(preview_artist, 'axes', None) is not None:
+                    preview_artist.remove()
+                auto_discard.append(member_tuple)
+                continue
+
+            visible_indices.append(idx)
+            visible_lookup[idx] = member_tuple
+            visible_artists.append(artists[idx])
+            visible_features.append(feature)
+            preview_artist = artists_in_plot[idx]
+            self._tweak_artist_for_preview(preview_artist)
+            visible_plot_artists.append(preview_artist)
+
+        return {
+            'artists': visible_artists,
+            'artists_in_plot': visible_plot_artists,
+            'path_features': visible_features,
+            'base_indices': visible_indices,
+            'duplicate_lookup': visible_lookup,
+            'hidden_duplicates': hidden_duplicates,
+            'auto_discard': tuple(auto_discard),
+            'original_count': len(path_features),
+        }
+
+    def _on_resize(self, _event):
+        if self._marker_preview_idx is not None:
+            if self._marker_preview_idx < len(self.artists):
+                self._draw_marker_preview(self._marker_preview_idx, redraw_only=True)
+            else:
+                self._marker_preview_idx = None
+                self.ax['marker'].clear()
+
+        if self._group_preview_idxs:
+            valid = [idx for idx in self._group_preview_idxs if idx < len(self.artists)]
+            if valid:
+                self._group_preview_idxs = valid
+                self._draw_group_preview(valid, redraw_only=True)
+            else:
+                self._group_preview_idxs = None
+                self.ax['group'].clear()
+                self.ax['group'].set_title('')
+                self.fig.canvas.draw_idle()
+
+    def _make_preview_artist(self, artist, axis):
+        preview = copy(artist)
+        preview.set_transform(axis.transData)
+        self._tweak_artist_for_preview(preview)
+        return preview
+
+    def _tweak_artist_for_preview(self, artist):
+        lw_min, lw_max = 0.3, 2.5
+        try:
+            if isinstance(artist, Line2D):
+                lw = artist.get_linewidth()
+                if np.isfinite(lw):
+                    artist.set_linewidth(min(max(lw, lw_min), lw_max))
+                ms = artist.get_markersize()
+                if np.isfinite(ms):
+                    artist.set_markersize(min(ms, 12))
+            elif isinstance(artist, LineCollection):
+                lws = artist.get_linewidths()
+                if lws is not None and len(lws):
+                    artist.set_linewidths(np.clip(lws, lw_min, lw_max))
+            elif isinstance(artist, (PatchCollection, PathCollection)):
+                lws = artist.get_linewidths()
+                if lws is not None and len(lws):
+                    artist.set_linewidths(np.clip(lws, lw_min, lw_max))
+            elif isinstance(artist, Patch):
+                lw = artist.get_linewidth()
+                if lw is not None and np.isfinite(lw):
+                    artist.set_linewidth(min(max(lw, lw_min), lw_max))
+        except Exception:
+            pass
+
+    def _draw_marker_preview(self, idx, redraw_only=False):
+        if not redraw_only:
+            self._marker_preview_idx = idx
+        ax = self.ax['marker']
+        ax.clear()
+        if idx is None or idx >= len(self.artists):
+            self.fig.canvas.draw_idle()
+            return
+        preview = self._make_preview_artist(self.artists[idx], ax)
+        add(ax, preview)
+        ax.autoscale(True)
+        ax.invert_yaxis()
+        self.fig.canvas.draw_idle()
+
+    def _draw_group_preview(self, indices, redraw_only=False):
+        if not redraw_only:
+            self._group_preview_idxs = list(indices)
+        elif self._group_preview_idxs is not None:
+            indices = self._group_preview_idxs
+        ax = self.ax['group']
+        ax.clear()
+        if not indices:
+            ax.set_title('')
+            self.fig.canvas.draw_idle()
+            return
+        count = 0
+        for idx in indices:
+            if idx is None or idx >= len(self.artists):
+                continue
+            preview = self._make_preview_artist(self.artists[idx], ax)
+            add(ax, preview)
+            count += 1
+        ax.autoscale(True)
+        ax.invert_yaxis()
+        ax.set_title(f'found {count}')
+        self.fig.canvas.draw_idle()
+
+    def _safe_extent_ratio(self, extent):
+        width, height = extent
+        eps = 1e-6
+        if width < eps or height < eps:
+            return None
+        return width / height
+
+    def _extent_compatible(self, base_extent, candidate_extent):
+        base_extent = np.asarray(base_extent, dtype=float)
+        candidate_extent = np.asarray(candidate_extent, dtype=float)
+        if base_extent.shape != (2,) or candidate_extent.shape != (2,):
+            return True
+        eps = 1e-6
+        base_diag = math.hypot(base_extent[0], base_extent[1])
+        cand_diag = math.hypot(candidate_extent[0], candidate_extent[1])
+        if base_diag < eps:
+            return cand_diag < 3 * eps
+        ratio = cand_diag / base_diag if base_diag else np.inf
+        if ratio < 0.5 or ratio > 2.0:
+            return False
+        base_ratio = self._safe_extent_ratio(base_extent)
+        cand_ratio = self._safe_extent_ratio(candidate_extent)
+        if base_ratio is None or cand_ratio is None:
+            return True
+        rel = cand_ratio / base_ratio if base_ratio else np.inf
+        return 0.5 <= rel <= 2.0
+
+    def _filter_matches(self, matched_idxs):
+        if self.type != 's':
+            return matched_idxs
+        base_extent = self.path_feature.get('extent')
+        base_artist_class = self.path_feature.get('artist_class')
+        filtered = []
+        for idx in matched_idxs:
+            feature = self.path_features[idx]
+            if base_artist_class and feature.get('artist_class') != base_artist_class:
+                continue
+            if base_extent is not None and feature.get('extent') is not None:
+                if not self._extent_compatible(base_extent, feature.get('extent')):
+                    continue
+            filtered.append(idx)
+        return filtered
+
+    def _find_line_like_match(self, indices):
+        for idx in indices:
+            artist = self.artists[idx]
+            if isinstance(artist, Line2D) and (artist.get_marker() in (None, '', ' ')):
+                return artist
+        return None
+
+    def _expand_duplicate_indices(self, base_indices):
+        expanded = []
+        for base_idx in np.atleast_1d(base_indices):
+            base_idx = int(base_idx)
+            expanded.extend(self._duplicate_lookup.get(base_idx, (base_idx,)))
+        return np.array(expanded, dtype=int)
+
+    def _remove_local_indices(self, remove_indices):
+        if not remove_indices:
+            return
+        remove_set = {int(idx) for idx in remove_indices if 0 <= int(idx) < len(self.artists)}
+        if not remove_set:
+            return
+
+        new_artists = []
+        new_artists_in_plot = []
+        new_path_features = []
+        new_indexes = []
+
+        for local_idx, (artist, preview, feature, base_idx) in enumerate(zip(self.artists, self.artists_in_plot, self.path_features, self.indexes)):
+            if local_idx in remove_set:
+                if getattr(preview, 'axes', None) is not None:
+                    preview.remove()
+                self._duplicate_lookup.pop(int(base_idx), None)
+            else:
+                new_artists.append(artist)
+                new_artists_in_plot.append(preview)
+                new_path_features.append(feature)
+                new_indexes.append(int(base_idx))
+
+        self.artists = new_artists
+        self.artists_in_plot = new_artists_in_plot
+        self.path_features = new_path_features
+        self.indexes = np.array(new_indexes, dtype=int) if new_indexes else np.array([], dtype=int)
+
+    def _commit_selection(self, matched_local_indices, label, match_mode=None):
+        local_indices = sorted({int(idx) for idx in np.atleast_1d(matched_local_indices) if 0 <= int(idx) < len(self.artists)})
+        if not local_indices:
+            self.state = 0
+            self.fig.suptitle(self._idle_title)
+            self.ax['group'].clear()
+            self.ax['group'].set_title('')
+            self.fig.canvas.draw_idle()
+            return False
+
+        base_indices = self.indexes[local_indices]
+        target_indices = self._expand_duplicate_indices(base_indices)
+        self.types[target_indices] = label
+
+        if label == 's' and match_mode is not None:
+            self.known_markers.append({
+                'match_by': match_mode,
+                'feature': self.path_feature,
+                'shape_tol': self.shape_tol,
+                'color_tol': self.color_tol,
+            })
+
+        self._remove_local_indices(local_indices)
+        self._marker_preview_idx = None
+        self._group_preview_idxs = None
+        self.ax['marker'].clear()
+        self.ax['group'].clear()
+        self.ax['group'].set_title('')
+        self.matched_idxs = []
+        self.state = 0
+        self.fig.suptitle(self._idle_title)
+        self.fig.canvas.draw_idle()
+        return True
         
     def onkeyrelease(self, event):
         if self.state == 0: #
@@ -232,77 +824,52 @@ class ElementIdentifier(BaseEventHandler):
                 self.finished = True
             else:
                 self.state = 0
-                self.fig.suptitle('click element to identify, or [F]inish')
+                self.fig.suptitle(self._idle_title)
         elif self.state >= 1 and self.state <= 9: # currently handling an object
-            if event.key == 'c': # cancelled
+            if event.key in ('c', 'escape'): # cancelled
                 self.state = 0
-                self.fig.suptitle('click element to identify, or [F]inish')
-                
+                self.fig.suptitle(self._idle_title)
+                self._marker_preview_idx = None
+                self._group_preview_idxs = None
+                self.matched_idxs = []
+                self.ax['marker'].clear()
+                self.ax['group'].clear()
+                self.ax['group'].set_title('')
+
+            elif self.state == 1 and event.key in ('delete', 'del', 'backspace', 'n'):
+                if self._marker_preview_idx is not None:
+                    self._commit_selection([self._marker_preview_idx], 'd')
+
             elif self.state == 1 and event.key in 'sldo': # have just chosen object type
                 self.type = event.key
                 # next step, choose how to match similar objects
                 self.fig.suptitle('chosen "{}". match [S]hape, c[O]lor, co[L]or+shape, or [C]ancel'.format(self.__class__.type_names[self.type]))
                 self.state = 2
-                
+
             elif self.state == 2 and event.key in 'sol':
                 self.match_mode = event.key
-                self.matched_idxs = select_paths(self.path_feature, self.path_features, modes=self.match_mode)
-                self.ax['group'].clear()
+                self.matched_idxs = select_paths(
+                    self.path_feature,
+                    self.path_features,
+                    modes=self.match_mode,
+                    pos_tol=self.shape_tol,
+                    color_tol=self.color_tol,
+                )
+                self.matched_idxs = self._filter_matches(self.matched_idxs)
                 warntxt = ''
-                for i, artist in enumerate(self.artists):
-                    if i in self.matched_idxs:
-                        add(self.ax['group'], copy(artist))
-                        # print(artist, isinstance(artist, Line2D))
-                        if self.type == 's' and not warntxt and isinstance(artist, Line2D):
-                            # print('here')
-                            warntxt = '\n(WARNING: elements labelled as "scatter", but at least one is line-like)'
-                self.ax['group'].set_title(f'found {len(self.matched_idxs)}')
-                self.ax['group'].autoscale(True)
-                self.ax['group'].invert_yaxis()
-                # self.ax['group'].set_xlim(self.ax['main'].get_xlim())
-                # self.ax['group'].set_ylim(self.ax['main'].get_ylim())
+                if self.type == 's':
+                    warn_artist = self._find_line_like_match(self.matched_idxs)
+                    if warn_artist is not None:
+                        warntxt = '\n(WARNING: elements labelled as "scatter", but at least one is line-like)'
+                self._draw_group_preview(self.matched_idxs)
                 self.fig.suptitle(f'press any key to continue or [C]ancel{warntxt}')
                 self.state = 3
-                    
+
             elif self.state == 3:
-                self.types[self.indexes[self.matched_idxs]] = self.type
-                    
-                if self.type == 's':
-                    self.known_markers.append({
-                        'match_by': self.match_mode,
-                        'feature': self.path_feature})
-                elif self.type == 'd':  
-                    pass
-                elif self.type =='l':
-                    pass
-                elif self.type == 'o':
-                    pass
-                else:
-                    raise ValueError
-                
-                # remove matched artists
-                new_artists = []
-                new_path_features = []
-                new_artists_in_plot = []
-                new_indexes = []
-                for i, artist in enumerate(self.artists):
-                    if i in self.matched_idxs:
-                        self.artists_in_plot[i].remove()
-                    else:
-                        new_artists.append(artist)
-                        new_artists_in_plot.append(self.artists_in_plot[i])
-                        new_path_features.append(self.path_features[i])
-                        new_indexes.append(self.indexes[i])
-                self.artists = new_artists
-                self.artists_in_plot = new_artists_in_plot
-                self.path_features = new_path_features
-                self.indexes = np.array(new_indexes)
-                
-                self.state = 0
-                self.fig.suptitle('click element to identify, or [F]inish')
+                self._commit_selection(self.matched_idxs, self.type, match_mode=self.match_mode)
         else:
             return
-            
+
         self.fig.canvas.draw()
             
     def save(self, basepath, yes=False):
@@ -432,6 +999,15 @@ class RectObjectSelector(RectSelector):
     def get_filtered_objects(self):
         # print(self.selected)
         return get_filtered_objects(self.orig_objects, self.selected)
+
+    def _finish_selection(self, _event=None):
+        if self.finished:
+            return
+
+        self.finished = True
+        self.display_ax.set_title('Selection complete. Close window to continue.')
+        self.fig.canvas.draw_idle()
+        plt.close(self.fig)
     
     
 class DataExtractor(BaseEventHandler):
@@ -465,9 +1041,9 @@ class DataExtractor(BaseEventHandler):
             }
         
         self.axes = {} # data axes information, not real axes for plot
-        self._ca = None # currect data axis number 
+        self._ca = None # currect data axis number
         self._next_axis = None # the next axis to be changed to
-        
+
         self.select_mode = 'touch'
         
         if pdf_path is not None:
@@ -478,8 +1054,9 @@ class DataExtractor(BaseEventHandler):
         else:
             raise NotImplementedError('please input pdf_path')
         
-        plot_objects(self.objects, ax=self.ax0)
-        
+        self._display_objects = deepcopy(self.objects)
+        plot_objects(self._display_objects, ax=self.ax0, optimize_preview=True)
+
         self.set_status(-1)
         
     @property
