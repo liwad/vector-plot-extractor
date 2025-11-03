@@ -105,6 +105,59 @@ def is_background_like(path_feature, background_color, tol):
     return color_match and fill_match
 
 
+def _contrast(value, background_color):
+    bg = _normalize_color(background_color)
+    if bg is None:
+        return 0.0
+    arr = _normalize_color(value)
+    if arr is None:
+        return 0.0
+    n = min(arr.size, bg.size)
+    if n == 0:
+        return 0.0
+    diff = arr[:n] - bg[:n]
+    return float(np.linalg.norm(diff))
+
+
+def marker_contrast(path_feature, background_color):
+    """Return a contrast score for ``path_feature`` against ``background_color``."""
+
+    color_contrast = _contrast(path_feature.get('color'), background_color)
+    fill_contrast = _contrast(path_feature.get('fill'), background_color)
+    return max(color_contrast, fill_contrast)
+
+
+def dedupe_by_contrast(matched_idxs, path_features, tol, background_color):
+    """Remove duplicate matches that share geometry, keeping the highest contrast."""
+
+    if len(matched_idxs) <= 1:
+        return matched_idxs
+
+    deduped = []
+    groups = []
+
+    for idx in matched_idxs:
+        feature = path_features[idx]
+        contrast = marker_contrast(feature, background_color)
+
+        for group in groups:
+            if eq(feature['rel_pos'], group['rel_pos'], eta=tol):
+                if contrast > group['contrast']:
+                    group['contrast'] = contrast
+                    group['index'] = idx
+                    deduped[group['order']] = idx
+                break
+        else:
+            order = len(deduped)
+            groups.append({'rel_pos': feature['rel_pos'],
+                           'contrast': contrast,
+                           'index': idx,
+                           'order': order})
+            deduped.append(idx)
+
+    return deduped
+
+
 def select_paths(target_feature, path_features, modes='s', *, tolerance=DEFAULT_TOLERANCE, background_color=None):
     if isinstance(modes, (tuple, list)) and len(modes) != len(path_features):
         raise ValueError(f'expected {len(path_features)} or 1 modes, got {len(modes)}')

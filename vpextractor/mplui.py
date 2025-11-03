@@ -8,7 +8,8 @@ Created on Thu Jan 18 19:28:30 2024
 import numpy as np
 import logging
 from .filter import (select_paths, rect_filter_objects, get_filtered_objects,
-                     normalize_rect_mode, DEFAULT_TOLERANCE, is_background_like)
+                     normalize_rect_mode, DEFAULT_TOLERANCE, is_background_like,
+                     dedupe_by_contrast)
 from copy import copy, deepcopy
 from .drawing import add, plot_objects, get_color, Line2D
 import matplotlib.pyplot as plt
@@ -188,6 +189,7 @@ class ElementIdentifier(BaseEventHandler):
         self.path_features = path_features
         self.indexes = np.arange(len(self.path_features), dtype=int)
         self.known_markers = []
+        self.discarded = []
         self.matches = []
         self.types = np.full((len(artists),), fill_value='u', dtype='S1') # [S]catter, [L]ine, [D]iscard. u means "not marked"
         self.state = 0
@@ -260,10 +262,21 @@ class ElementIdentifier(BaseEventHandler):
                     modes=self.match_mode,
                     tolerance=self.tolerance,
                     background_color=self.background_color)
+                duplicates_removed = 0
+                if self.type == 's':
+                    deduped = dedupe_by_contrast(
+                        list(self.matched_idxs),
+                        self.path_features,
+                        self.tolerance,
+                        self.background_color)
+                    duplicates_removed = len(self.matched_idxs) - len(deduped)
+                    self.matched_idxs = deduped
                 self.ax['group'].clear()
                 warntxt = ''
                 if not self.matched_idxs and is_background_like(self.path_feature, self.background_color, self.tolerance):
                     warntxt = '\n(Selected element matches the background and was ignored)'
+                if duplicates_removed:
+                    warntxt += f'\n(Filtered {duplicates_removed} overlapping marker layer{"s" if duplicates_removed > 1 else ""})'
                 for i, artist in enumerate(self.artists):
                     if i in self.matched_idxs:
                         add(self.ax['group'], copy(artist))
@@ -287,8 +300,12 @@ class ElementIdentifier(BaseEventHandler):
                         'match_by': self.match_mode,
                         'feature': self.path_feature,
                         'tolerance': self.tolerance})
-                elif self.type == 'd':  
-                    pass
+                elif self.type == 'd':
+                    self.discarded.append({
+                        'match_by': self.match_mode,
+                        'feature': self.path_feature,
+                        'tolerance': self.tolerance,
+                        'indexes': self.indexes[self.matched_idxs].tolist()})
                 elif self.type =='l':
                     pass
                 elif self.type == 'o':
