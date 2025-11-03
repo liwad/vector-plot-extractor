@@ -37,10 +37,8 @@ def add(ax, artist):
         ax.add_patch(artist)
     elif isinstance(artist, (Line2D)):
         ax.add_line(artist)
-    elif isinstance(artist, (PatchCollection, LineCollection)):
+    elif isinstance(artist, (PatchCollection, PathCollection, LineCollection)):
         ax.add_collection(artist)
-    # elif isinstance(artist, PathCollection):
-    #     ax.add_artist(artist)
     else:
         raise TypeError(type(artist))
 
@@ -48,7 +46,7 @@ def get_color(artist):
     # get color from artist
     if isinstance(artist, (Line2D)):
         return {'color': (artist.get_color())}
-    elif isinstance(artist, PatchCollection):
+    elif isinstance(artist, (PatchCollection, PathCollection)):
         return {'facecolor': dedup(artist.get_facecolor()),
                 'edgecolor': dedup(artist.get_edgecolor())}
     elif isinstance(artist, LineCollection): # this is a collection of lines as markers of scatter
