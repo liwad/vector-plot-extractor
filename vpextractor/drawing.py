@@ -37,10 +37,8 @@ def add(ax, artist):
         ax.add_patch(artist)
     elif isinstance(artist, (Line2D)):
         ax.add_line(artist)
-    elif isinstance(artist, (PatchCollection, LineCollection)):
+    elif isinstance(artist, (PatchCollection, PathCollection, LineCollection)):
         ax.add_collection(artist)
-    # elif isinstance(artist, PathCollection):
-    #     ax.add_artist(artist)
     else:
         raise TypeError(type(artist))
 
@@ -48,7 +46,7 @@ def get_color(artist):
     # get color from artist
     if isinstance(artist, (Line2D)):
         return {'color': (artist.get_color())}
-    elif isinstance(artist, PatchCollection):
+    elif isinstance(artist, (PatchCollection, PathCollection)):
         return {'facecolor': dedup(artist.get_facecolor()),
                 'edgecolor': dedup(artist.get_edgecolor())}
     elif isinstance(artist, LineCollection): # this is a collection of lines as markers of scatter
@@ -348,6 +346,32 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
         idx0 = -1
         scatter_coords = []
         unrecognized_paths = []
+        def _flush_scatter():
+            nonlocal scatter, idx0
+            if not scatter:
+                return
+            artists_type = list({type(a) for a in scatter_artists})
+            if len(artists_type) > 1:
+                raise TypeError(f'expected one single type for a collection of scatter, got {artists_type}')
+            artists_type = artists_type[0]
+            if artists_type == Line2D:
+                warnings.warn(f'a group of {len(scatter_artists)} line-like objects marked as scatters')
+                lc_kwargs = {  # LineCollection kwargs
+                    'linewidths': [_clamp_linewidth(l.get_linewidth()) for l in scatter_artists],
+                    'colors': [to_rgba(l.get_color(), l.get_alpha()) for l in scatter_artists],
+                    'linestyles': [l.get_linestyle() for l in scatter_artists],
+                }
+                collection = LineCollection((a.get_xydata() for a in scatter_artists), **lc_kwargs)
+            else:
+                collection = PatchCollection(scatter_artists, match_original=True)
+            objects['s'].append({
+                'artist': collection,  # todo: what if user mark line as scatter? should disallow it!
+                'coords': np.array(scatter_coords).T})
+            scatter = False
+            idx0 = -1
+            scatter_artists.clear()
+            scatter_coords.clear()
+
         for path, typ in zip(paths, typestr):
             try:
                 item_type, coords, artist, path_feature = parse_path(path)
@@ -364,40 +388,23 @@ def group_paths(paths, typestr=None, markers=None, marker_getter='mean', mode='t
                 idx = idx[0]
     
             if scatter and (typ != 's' or idx != idx0): # ends a group of scatter
-                artists_type = list({type(a) for a in scatter_artists})
-                if len(artists_type) > 1:
-                    raise TypeError(f'expected one single type for a collection of scatter, got {artists_type}')
-                artists_type = artists_type[0]
-                if artists_type == Line2D:
-                    warnings.warn(f'a group of {len(scatter_artists)} line-like objects marked as scatters')
-                    lc_kwargs = { # LineCollection kwargs
-                        'linewidths': [_clamp_linewidth(l.get_linewidth()) for l in scatter_artists],
-                        'colors': [to_rgba(l.get_color(), l.get_alpha()) for l in scatter_artists],
-                        'linestyles': [l.get_linestyle() for l in scatter_artists],
-                        }
-                    collection = LineCollection((a.get_xydata() for a in scatter_artists), **lc_kwargs)
-                else:
-                    collection = PatchCollection(scatter_artists, match_original=True)
-                objects['s'].append({
-                    'artist': collection, # todo: what if user mark line as scatter? should disallow it!
-                    'coords': np.array(scatter_coords).T})
-                scatter = False
-                idx0 = -1
-                scatter_artists.clear()
-                scatter_coords.clear()
-            
+                _flush_scatter()
+
             if typ == 's':
                 scatter = True
                 idx0 = idx
                 scatter_artists.append(artist)
                 scatter_coords.append(marker_getter(coords))
-    
+
             elif typ in ['u', 'l', 'o']:
                 objects[typ].append({'artist': artist,
                                      'coords': coords})
             elif typ == 'd':
                 continue
-                
+
+        if scatter:
+            _flush_scatter()
+
         if unrecognized_paths:
             print(f'WARNING: {len(unrecognized_paths)} unrecognized elements')
 
